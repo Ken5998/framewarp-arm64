@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          dnf -y install gcc-c++ cmake make vulkan-headers vulkan-loader-devel glslang tar gzip \
+          dnf -y install gcc-c++ libstdc++-static cmake make vulkan-headers vulkan-loader-devel glslang tar gzip \
             mesa-vulkan-drivers vulkan-tools vulkan-validation-layers xorg-x11-server-Xvfb
       - uses: actions/checkout@v5
       - name: Check the scripts
