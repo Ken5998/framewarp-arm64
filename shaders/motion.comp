@@ -4,13 +4,13 @@
 
 // Block matching: for every 8x8 block of the 1/4 size luma, find where it
 // was in the previous frame. A coarse search on the 1/16 size luma (4x4
-// window, +-5 pixels there, so +-80 frame pixels) then a fine one on the 1/4
+// window, +-8 pixels there, so +-128 frame pixels) then a fine one on the 1/4
 // size luma (8x8 block, +-3 pixels around the coarse match). The motion is
 // stored in frame pixels per real frame, with the match error.
 
 layout(local_size_x = 64) in;
 
-const int kCoarse = 11;  // 11x11 candidates on luma2
+const int kCoarse = 17;  // 17x17 candidates on luma2
 const int kWindow = 4;   // coarse window, luma2 pixels
 const int kFine = 7;     // 7x7 candidates on luma
 

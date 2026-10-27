@@ -27,8 +27,22 @@ void main()
     vec3 here = texture(frame, uv).rgb;
     vec2 m = vec2(0.0);
     if (pc.mode != 0 && pc.has_prev != 0) {
-        ivec2 lp = min(ivec2(gl_FragCoord.xy) / kScale, textureSize(pixel_motion, 0) - 1);
-        m = texelFetch(pixel_motion, lp, 0).xy;
+        // The motion is known per 4x4 pixels; each pixel takes, of the 2x2
+        // nearest of those, the vector that best explains its own colour in
+        // the previous frame, so edges stay sharp instead of 4x4 steps.
+        ivec2 size = textureSize(pixel_motion, 0);
+        ivec2 base = ivec2(floor(gl_FragCoord.xy / float(kScale) - 0.5));
+        float best = 1e9;
+        for (int y = 0; y <= 1; y++)
+            for (int x = 0; x <= 1; x++) {
+                vec2 cand = texelFetch(pixel_motion, clamp(base + ivec2(x, y), ivec2(0), size - 1), 0).xy;
+                vec3 d = abs(here - texture(frame_prev, uv - cand * px).rgb);
+                float cost = d.r + d.g + d.b;
+                if (cost < best) {
+                    best = cost;
+                    m = cand;
+                }
+            }
     }
     vec3 c = here;
     if (dot(m, m) > 0.0 && !unchanged(uv)) {

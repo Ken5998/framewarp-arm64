@@ -46,7 +46,9 @@ constexpr int kRing = 8;
 // ---------------------------------------------------------------- config
 
 struct Config {
-    int multiplier = 2;
+    int multiplier = 2;    // with auto: the most frames shown per real frame
+    bool auto_mult = false;
+    double refresh = 1.0 / 60.0;
     bool force_fifo = true;
     int mode = 1; // 0 = copy, 1 = warp, 2 = warp + motion overlay
     float zero_bias = 0.05f;
@@ -75,7 +77,13 @@ void load_config()
 {
     static std::once_flag once;
     std::call_once(once, [] {
-        g_cfg.multiplier = std::clamp(env_int("FRAMEWARP_MULT", 2), 1, kMaxMultiplier);
+        if (const char *m = getenv("FRAMEWARP_MULT"); m && !strcmp(m, "auto")) {
+            g_cfg.auto_mult = true;
+            g_cfg.multiplier = std::clamp(env_int("FRAMEWARP_MAX_MULT", 3), 1, kMaxMultiplier);
+        } else {
+            g_cfg.multiplier = std::clamp(env_int("FRAMEWARP_MULT", 2), 1, kMaxMultiplier);
+        }
+        g_cfg.refresh = 1.0 / std::clamp(env_float("FRAMEWARP_REFRESH", 60.0f), 24.0f, 240.0f);
         g_cfg.force_fifo = env_int("FRAMEWARP_FORCE_FIFO", 1) != 0;
         if (const char *m = getenv("FRAMEWARP_MODE"); m && *m)
             g_cfg.mode = !strcmp(m, "copy") ? 0 : !strcmp(m, "debug") ? 2 : 1;
@@ -244,6 +252,54 @@ struct Stats {
     double copy_ms = 0, gen_ms = 0, gen_ms_max = 0, motion_ms = 0;
     int copy_n = 0, gen_n = 0, motion_n = 0;
     double extra_cpu_ms = 0, extra_cpu_ms_max = 0;
+    int generated = 0;
+};
+
+// FRAMEWARP_MULT=auto: how many frames to generate per real frame. Every
+// half second it compares the game's frame interval with what the current
+// count allows: a slower game gets one more generated frame. Since the layer
+// itself holds the game at that rate, it can't see when the game could go
+// faster, so now and then it tries one generated frame less and keeps it if
+// the game keeps up; a failed try waits longer before the next one.
+struct AutoMultiplier {
+    int generated = 0;
+    bool probing = false;
+    double window_start = 0, next_probe = 0, backoff = 10.0;
+    double sum = 0;
+    int frames = 0;
+
+    void update(double t, double interval, int most)
+    {
+        if (window_start == 0) {
+            window_start = t;
+            next_probe = t + backoff;
+            return;
+        }
+        sum += interval;
+        frames++;
+        if (t - window_start < 0.5 || frames < 4)
+            return;
+        double avg = sum / frames;
+        double cap = (generated + 1) * g_cfg.refresh;
+        if (probing) {
+            probing = false;
+            if (avg <= cap * 1.1) {
+                backoff = 10.0;
+            } else {
+                generated++;
+                backoff = std::min(backoff * 2.0, 60.0);
+            }
+            next_probe = t + backoff;
+        } else if (avg > cap * 1.15 && generated < most) {
+            generated++;
+        } else if (generated > 0 && t >= next_probe) {
+            generated--;
+            probing = true;
+        }
+        window_start = t;
+        sum = 0;
+        frames = 0;
+    }
 };
 
 struct Image {
@@ -305,6 +361,7 @@ struct SwapchainData {
     bool timestamps = false;
 
     Stats stats;
+    AutoMultiplier auto_mult;
 };
 
 std::mutex g_mutex;
@@ -412,8 +469,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkD
     VkPhysicalDeviceProperties props;
     inst->GetPhysicalDeviceProperties(physical, &props);
     data->timestamp_period = props.limits.timestampPeriod;
-    logf("device %s, multiplier %d, mode %d, zero bias %.2f, force_fifo %d", props.deviceName,
-         g_cfg.multiplier, g_cfg.mode, g_cfg.zero_bias, g_cfg.force_fifo);
+    logf("device %s, multiplier %s%d, mode %d, zero bias %.2f, force_fifo %d", props.deviceName,
+         g_cfg.auto_mult ? "auto up to " : "", g_cfg.multiplier, g_cfg.mode, g_cfg.zero_bias, g_cfg.force_fifo);
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_devices[key(*out)] = std::move(data);
@@ -922,11 +979,12 @@ void report(SwapchainData *sc, double t)
     if (dt < g_cfg.log_every)
         return;
     logf("real %.1f fps (worst gap %.1f ms), shown %.1f fps, missed %d | GPU copy %.2f ms, motion %.2f ms, "
-         "generated frame %.2f ms (max %.2f) | CPU in extra presents %.2f ms (max %.2f)",
+         "generated frame %.2f ms (max %.2f) | CPU in extra presents %.2f ms (max %.2f)%s",
          st.real / dt, st.interval_max * 1e3, st.shown / dt, st.missed,
          st.copy_n ? st.copy_ms / st.copy_n : 0.0, st.motion_n ? st.motion_ms / st.motion_n : 0.0,
          st.gen_n ? st.gen_ms / st.gen_n : 0.0,
-         st.gen_ms_max, st.real ? st.extra_cpu_ms / st.real : 0.0, st.extra_cpu_ms_max);
+         st.gen_ms_max, st.real ? st.extra_cpu_ms / st.real : 0.0, st.extra_cpu_ms_max,
+         g_cfg.auto_mult ? (" | generating " + std::to_string(sc->auto_mult.generated) + " per frame").c_str() : "");
     double last = st.last_real;
     st = Stats{};
     st.window_start = t;
@@ -991,7 +1049,7 @@ VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
     return d->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
 }
 
-VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, uint32_t image,
+VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, int shown_per_real, uint32_t image,
                            VkSemaphore wait, VkSemaphore signal)
 {
     DeviceData *d = sc->dev;
@@ -1015,7 +1073,7 @@ VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, uin
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->pipeline);
     d->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->layout, 0, 1, &sc->sets[sc->cur], 0,
                              nullptr);
-    PushConstants pc = push_constants(sc, (float)k / (float)g_cfg.multiplier);
+    PushConstants pc = push_constants(sc, (float)k / (float)shown_per_real);
     d->CmdPushConstants(cmd, sc->layout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc,
                         &pc);
     d->CmdDraw(cmd, 3, 1, 0, 0);
@@ -1070,8 +1128,12 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     Stats &st = sc->stats;
     if (st.window_start == 0)
         st.window_start = t0;
-    if (st.last_real > 0)
+    if (st.last_real > 0) {
         st.interval_max = std::max(st.interval_max, t0 - st.last_real);
+        if (g_cfg.auto_mult)
+            sc->auto_mult.update(t0, t0 - st.last_real, g_cfg.multiplier - 1);
+    }
+    const int shown_per_real = g_cfg.auto_mult ? sc->auto_mult.generated + 1 : g_cfg.multiplier;
     st.last_real = t0;
     st.real++;
 
@@ -1156,7 +1218,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         result = VK_ERROR_DEVICE_LOST;
     sc->has_prev = result >= 0;
     if (result >= 0) {
-        for (int k = 1; k < g_cfg.multiplier; k++) {
+        for (int k = 1; k < shown_per_real; k++) {
             uint32_t idx;
             VkResult ar = d->AcquireNextImageKHR(d->device, sc->swapchain, 100000000ull, s.acquired[k],
                                                  VK_NULL_HANDLE, &idx);
@@ -1166,7 +1228,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
                     result = ar;
                 break;
             }
-            if (record_and_submit(sc, queue, s, k, idx, s.acquired[k], s.drawn[k]) != VK_SUCCESS) {
+            if (record_and_submit(sc, queue, s, k, shown_per_real, idx, s.acquired[k], s.drawn[k]) != VK_SUCCESS) {
                 st.missed++;
                 break;
             }

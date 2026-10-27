@@ -305,7 +305,7 @@ int main()
         bool split;
     };
     const Case cases[] = {{0, 0, false},   {12, -8, false}, {-20, 4, false}, {30, 18, false},
-                          {-60, -40, false}, {24, 8, true},   {-36, 0, true}};
+                          {-60, -40, false}, {100, -60, false}, {24, 8, true}, {-36, 0, true}};
     int failures = 0;
     for (const Case &c : cases) {
         float dx = (float)c.dx, dy = (float)c.dy;

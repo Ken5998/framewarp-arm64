@@ -28,11 +28,12 @@ On every present of the game the layer:
 2. presents the game's image, unchanged and without delay;
 3. estimates the motion between this frame and the previous one: block
    matching on a 1/4 size luma copy, with a coarse search on a 1/16 size copy
-   first (up to about 80 pixels per real frame), then a 3x3 median filter
+   first (up to about 128 pixels per real frame), then a 3x3 median filter
    over the blocks (one per 32x32 pixels); then every 4x4 pixels pick, among
    the vectors of their block, its neighbours and zero, the one that matches
    them best, so the edge of the car and the road behind it each keep their
-   own motion;
+   own motion (and each pixel of the generated frame picks the best of the 4
+   nearest of those);
 4. acquires `FRAMEWARP_MULT - 1` more images from the same swapchain and
    draws in each the last real frame pushed forward along that motion, a
    third and two thirds of a real frame ahead with `FRAMEWARP_MULT=3`, then
@@ -43,7 +44,11 @@ On every present of the game the layer:
 
 The swapchain runs in FIFO mode, so each present shows for one refresh: on a
 60 Hz panel `FRAMEWARP_MULT=3` shows 60 frames per second from 20 real ones
-and holds the game at 20.
+and holds the game at 20. `FRAMEWARP_MULT=auto` instead generates only as many
+frames as the game needs: none where it reaches 60 by itself (intros, menus),
+two where it runs at 20. Since the layer holds the game at the rate it picked,
+it tries one generated frame less every 10 to 60 seconds and keeps that if the
+game keeps up, so a failed try shows as a short stutter.
 
 Because the motion comes from the picture only, the generated frames still
 smear a little where something appears from behind something else, motion is
@@ -73,7 +78,9 @@ per second, and the controls answered as without the layer.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FRAMEWARP` | off | `1` turns the layer on for this game |
-| `FRAMEWARP_MULT` | `2` | frames shown per real frame, 1 to 4 (60 Hz panel: 3 for a 20 fps game, 2 for 30 fps) |
+| `FRAMEWARP_MULT` | `2` | frames shown per real frame, 1 to 4 (60 Hz panel: 3 for a 20 fps game, 2 for 30 fps), or `auto` |
+| `FRAMEWARP_MAX_MULT` | `3` | with `auto`, the most frames shown per real frame |
+| `FRAMEWARP_REFRESH` | `60` | the panel's refresh rate, for `auto` |
 | `FRAMEWARP_FORCE_FIFO` | `1` | forces FIFO presents, so every frame gets its own refresh |
 | `FRAMEWARP_MODE` | `warp` | `warp`; `copy` repeats the last real frame (no motion); `debug` warps and colours the motion it found |
 | `FRAMEWARP_ZERO_BIAS` | `0.05` | 0 to 0.5, how much a block prefers "no motion" over a match that is only slightly better (steadier HUD) |
@@ -89,7 +96,8 @@ real 19.9 fps (worst gap 53.6 ms), shown 59.8 fps, missed 0 | GPU copy 0.23 ms, 
 
 `real` is what the game renders, `shown` what reaches the swapchain, `missed`
 counts extra frames that could not be shown, and the GPU times are what the
-layer costs per real frame (copy and motion) and per generated frame.
+layer costs per real frame (copy and motion) and per generated frame. With
+`auto` the line ends with how many frames it generates per real frame.
 
 ## Build
 
