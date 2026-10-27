@@ -1,0 +1,170 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Camera mode: one motion for the whole frame. Fits motion(p) = A p + b
+// (pan, zoom, roll and shear) to the block vectors by weighted least
+// squares, then reweights the blocks by how well they fit, a few rounds, so
+// the player's car, the HUD and smoke, which don't move with the camera,
+// stop pulling the fit. Two starts, and the fit that more blocks agree with
+// wins:
+// - all blocks, with the reweighting tightening round by round;
+// - the most common moving block vector, as a pan first, which holds when
+//   a large still part (car, HUD) would bend the first one.
+
+layout(local_size_x = 256) in;
+
+const int kThreads = 256;
+const int kRounds = 6;        // per start
+const int kPanRounds = 2;     // second start: rounds that fit a pan only
+const float kSigma = 4.0;     // frame pixels, final width of "agrees with the fit"
+const int kBins = 65;         // block vectors are multiples of 4 in -128..128
+
+shared float sums[kThreads][12];
+shared vec3 row0, row1;
+shared vec3 best0, best1;
+shared float best_support;
+shared uint hist[2][kBins];
+
+// How much a block's vector can be trusted: blocks that matched badly, or
+// that match anything (flat sky and road, which say "no motion" whatever the
+// camera does), weigh less.
+float confidence(vec4 m)
+{
+    return m.w * m.w / (m.w * m.w + 0.02 * 0.02) / (1.0 + m.z * m.z / (0.03 * 0.03));
+}
+
+int bin(float v)
+{
+    return clamp(int(round(v / 4.0)) + kBins / 2, 0, kBins - 1);
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationIndex;
+    ivec2 blocks = textureSize(motion, 0);
+    vec2 size = vec2(textureSize(frame, 0));
+    int n = blocks.x * blocks.y;
+
+    // The most common x and y among the block vectors that move.
+    if (t < kBins) {
+        hist[0][t] = 0u;
+        hist[1][t] = 0u;
+    }
+    if (t == 0)
+        best_support = -1.0;
+    barrier();
+    for (int i = int(t); i < n; i += kThreads) {
+        ivec2 b = ivec2(i % blocks.x, i / blocks.x);
+        if (any(greaterThanEqual((vec2(b) + 0.5) * float(kScale * kBlock), size)))
+            continue;
+        vec4 m = texelFetch(motion, b, 0);
+        if (m.xy == vec2(0.0))
+            continue;
+        uint w = uint(confidence(m) * 1024.0);
+        atomicAdd(hist[0][bin(m.x)], w);
+        atomicAdd(hist[1][bin(m.y)], w);
+    }
+    barrier();
+
+    for (int start = 0; start < 2; start++) {
+        if (t < 2) {
+            vec3 r = vec3(0.0);
+            if (start == 1) {
+                int best = kBins / 2;
+                for (int k = 0; k < kBins; k++)
+                    if (hist[t][k] > hist[t][best])
+                        best = k;
+                r.z = float((best - kBins / 2) * 4);
+            }
+            if (t == 0)
+                row0 = r;
+            else
+                row1 = r;
+        }
+        barrier();
+
+        for (int it = 0; it < kRounds; it++) {
+            // First start: plain least squares, then a width that halves
+            // down to kSigma. Second start: kSigma from the first round.
+            float sigma = start == 0 ? max(kSigma, 64.0 / float(1 << (2 * it))) : kSigma;
+            bool weigh = start == 1 || it > 0;
+            float acc[12];
+            for (int k = 0; k < 12; k++)
+                acc[k] = 0.0;
+            for (int i = int(t); i < n; i += kThreads) {
+                ivec2 b = ivec2(i % blocks.x, i / blocks.x);
+                vec2 centre = (vec2(b) + 0.5) * float(kScale * kBlock);
+                if (any(greaterThanEqual(centre, size)))
+                    continue;
+                vec4 m = texelFetch(motion, b, 0);
+                vec3 q = vec3((centre - 0.5 * size) / size.y, 1.0);
+                float w = confidence(m);
+                if (weigh) {
+                    vec2 r = m.xy - vec2(dot(row0, q), dot(row1, q));
+                    float g = 1.0 + dot(r, r) / (sigma * sigma);
+                    w /= g * g;
+                }
+                // Normal equations: M = sum w q q^T (6 values), rhs for x and y.
+                acc[0] += w * q.x * q.x;
+                acc[1] += w * q.x * q.y;
+                acc[2] += w * q.x;
+                acc[3] += w * q.y * q.y;
+                acc[4] += w * q.y;
+                acc[5] += w;
+                acc[6] += w * m.x * q.x;
+                acc[7] += w * m.x * q.y;
+                acc[8] += w * m.x;
+                acc[9] += w * m.y * q.x;
+                acc[10] += w * m.y * q.y;
+                acc[11] += w * m.y;
+            }
+            for (int k = 0; k < 12; k++)
+                sums[t][k] = acc[k];
+            barrier();
+            for (uint stride = kThreads / 2; stride > 0; stride /= 2) {
+                if (t < stride)
+                    for (int k = 0; k < 12; k++)
+                        sums[t][k] += sums[t + stride][k];
+                barrier();
+            }
+            if (t == 0) {
+                float s[12];
+                for (int k = 0; k < 12; k++)
+                    s[k] = sums[0][k];
+                bool last = it == kRounds - 1;
+                // The total weight of the last round is how many blocks agree
+                // with the fit of the round before.
+                if (last && s[5] > best_support) {
+                    best_support = s[5];
+                    best0 = row0;
+                    best1 = row1;
+                }
+                mat3 M = mat3(s[0], s[1], s[2], s[1], s[3], s[4], s[2], s[4], s[5]);
+                vec3 bx = vec3(s[6], s[7], s[8]);
+                vec3 by = vec3(s[9], s[10], s[11]);
+                if (last) {
+                } else if (s[5] <= 1e-6) {
+                    row0 = vec3(0.0);
+                    row1 = vec3(0.0);
+                } else if ((start == 0 || it >= kPanRounds) && abs(determinant(M)) > 1e-9 * s[5] * s[5] * s[5]) {
+                    mat3 inv = inverse(M);
+                    row0 = inv * bx;
+                    row1 = inv * by;
+                } else {
+                    // A pan only: second start's first rounds, or too few
+                    // blocks to tell zoom from pan.
+                    row0 = vec3(0.0, 0.0, s[8] / s[5]);
+                    row1 = vec3(0.0, 0.0, s[11] / s[5]);
+                }
+            }
+            barrier();
+        }
+    }
+    if (t == 0) {
+        bool ok = pc.has_prev != 0 && all(lessThan(abs(vec4(best0, best1.x)), vec4(1e4))) &&
+                  abs(best1.y) < 1e4 && abs(best1.z) < 1e4;
+        imageStore(camera_out, ivec2(0, 0), ok ? vec4(best0, 0.0) : vec4(0.0));
+        imageStore(camera_out, ivec2(1, 0), ok ? vec4(best1, 0.0) : vec4(0.0));
+    }
+}

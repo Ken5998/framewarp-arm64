@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "filter_comp.h"
+#include "global_comp.h"
 #include "luma_comp.h"
 #include "motion_comp.h"
 #include "pyramid_comp.h"
@@ -61,13 +62,13 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want)
     exit(2);
 }
 
-Image make_image(VkFormat format, uint32_t size, VkImageUsageFlags usage)
+Image make_image(VkFormat format, uint32_t size, VkImageUsageFlags usage, uint32_t width = 0)
 {
     Image img{};
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = format;
-    ici.extent = {size, size, 1};
+    ici.extent = {width ? width : size, size, 1};
     ici.mipLevels = ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.usage = usage;
@@ -216,9 +217,11 @@ int main()
     Image motion_raw = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kMotion, storage);
     Image motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kMotion, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     Image pixel_motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kLuma, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    Image camera = make_image(VK_FORMAT_R32G32B32A32_SFLOAT, 1, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 2);
     Buffer upload = make_buffer(kSize * kSize * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     Buffer readback = make_buffer(kMotion * kMotion * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer readback_px = make_buffer(kLuma * kLuma * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer readback_cam = make_buffer(2 * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
@@ -230,15 +233,15 @@ int main()
 
     // Same bindings as shaders/common.glsl and the layer.
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    constexpr uint32_t kBindings = 13;
-    const VkDescriptorType types[kBindings] = {S, S, S, I, I, I, S, S, S, I, S, I, S};
+    constexpr uint32_t kBindings = 15;
+    const VkDescriptorType types[kBindings] = {S, S, S, I, I, I, S, S, S, I, S, I, S, I, S};
     VkDescriptorSetLayoutBinding b[kBindings];
     for (uint32_t i = 0; i < kBindings; i++)
         b[i] = {i, types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, kBindings, b};
     VkDescriptorSetLayout set_layout;
     VK(vkCreateDescriptorSetLayout(device, &dlci, nullptr, &set_layout));
-    VkDescriptorPoolSize ps[2] = {{S, 16}, {I, 10}};
+    VkDescriptorPoolSize ps[2] = {{S, 18}, {I, 12}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 2, 2, ps};
     VkDescriptorPool dpool;
     VK(vkCreateDescriptorPool(device, &dpci, nullptr, &dpool));
@@ -250,11 +253,11 @@ int main()
         VkImageView views[kBindings] = {frame.view, luma[c].view, luma[1 - c].view, luma[c].view,
                                         motion_raw.view, motion.view, motion.view,
                                         luma2[c].view, luma2[1 - c].view, luma2[c].view,
-                                        frame.view, pixel_motion.view, pixel_motion.view};
+                                        frame.view, pixel_motion.view, pixel_motion.view, camera.view, camera.view};
         VkDescriptorImageInfo info[kBindings];
         VkWriteDescriptorSet w[kBindings];
         for (uint32_t i = 0; i < kBindings; i++) {
-            bool exact = i == 1 || i == 2 || i == 7 || i == 8 || i == 12;
+            bool exact = i == 1 || i == 2 || i == 7 || i == 8 || i == 12 || i == 14;
             info[i] = {types[i] != S ? VK_NULL_HANDLE : exact ? nearest : linear, views[i], VK_IMAGE_LAYOUT_GENERAL};
             w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[c], i, 0, 1, types[i], &info[i]};
         }
@@ -289,34 +292,52 @@ int main()
     VkPipeline motion_p = pipeline(motion_comp, sizeof motion_comp);
     VkPipeline filter_p = pipeline(filter_comp, sizeof filter_comp);
     VkPipeline refine_p = pipeline(refine_comp, sizeof refine_comp);
+    VkPipeline global_p = pipeline(global_comp, sizeof global_comp);
 
     VkCommandBuffer cmd = begin();
     for (VkImage img : {frame.image, luma[0].image, luma[1].image, luma2[0].image, luma2[1].image,
-                        motion_raw.image, motion.image, pixel_motion.image})
+                        motion_raw.image, motion.image, pixel_motion.image, camera.image})
         to_general(cmd, img);
     end(cmd);
 
     // Each case: the pattern moves by (dx, dy) frame pixels between the two
     // frames, everywhere or (split) only in the left half while the right
     // half stays still. The blocks should find that motion to the 4 pixel
-    // grid, and the per pixel motion should follow the split.
+    // grid, and the per pixel motion should follow the split. Some cases
+    // also zoom the pattern about the centre, or keep a still strip at the
+    // bottom like a HUD; those only check the camera model, which should
+    // give the motion of the pattern everywhere.
     struct Case {
         int dx, dy;
         bool split;
+        float zoom = 1.0f;
+        bool hud = false;
     };
-    const Case cases[] = {{0, 0, false},   {12, -8, false}, {-20, 4, false}, {30, 18, false},
-                          {-60, -40, false}, {100, -60, false}, {24, 8, true}, {-36, 0, true}};
+    const Case cases[] = {{0, 0, false},      {12, -8, false},       {-20, 4, false},       {30, 18, false},
+                          {-60, -40, false},  {100, -60, false},     {24, 8, true},         {-36, 0, true},
+                          {0, 0, false, 1.05f}, {8, -4, false, 0.96f}, {12, 6, false, 1.0f, true},
+                          {-6, 10, false, 1.03f, true}};
     int failures = 0;
     for (const Case &c : cases) {
         float dx = (float)c.dx, dy = (float)c.dy;
         auto moving = [&](float x) { return !c.split || x < kSize / 2; };
+        const float half = kSize / 2.0f;
+        // Where the pattern at frame 1 pixel (x, y) was in frame 0.
+        auto source = [&](float x, float y, float &sx, float &sy) {
+            sx = half + (x - half) / c.zoom - dx;
+            sy = half + (y - half) / c.zoom - dy;
+        };
+        const bool camera_only = c.zoom != 1.0f || c.hud;
+        pc.mode = camera_only ? 3 : 1;
         for (int f = 0; f < 2; f++) {
             auto *px = (uint8_t *)upload.data;
             for (uint32_t y = 0; y < kSize; y++)
                 for (uint32_t x = 0; x < kSize; x++) {
                     // Frame 1 shows the pattern moved by (dx, dy).
-                    bool shift = f && moving((float)x);
-                    float v = noise((float)x - (shift ? dx : 0) + 1000, (float)y - (shift ? dy : 0) + 1000);
+                    float sx = (float)x, sy = (float)y;
+                    if (f && moving((float)x) && !(c.hud && y >= kSize * 3 / 4))
+                        source((float)x, (float)y, sx, sy);
+                    float v = noise(sx + 1000, sy + 1000);
                     uint8_t g = (uint8_t)(v * 255.0f);
                     px[0] = px[1] = px[2] = g;
                     px[3] = 255;
@@ -343,6 +364,9 @@ int main()
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, filter_p);
                 vkCmdDispatch(cmd, (kMotion + 7) / 8, (kMotion + 7) / 8, 1);
                 barrier(cmd);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, global_p);
+                vkCmdDispatch(cmd, 1, 1, 1);
+                barrier(cmd);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, refine_p);
                 vkCmdDispatch(cmd, kLuma / 8, kLuma / 8, 1);
                 barrier(cmd);
@@ -352,8 +376,53 @@ int main()
                 vkCmdCopyImageToBuffer(cmd, motion.image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &rb);
                 rb.imageExtent = {kLuma, kLuma, 1};
                 vkCmdCopyImageToBuffer(cmd, pixel_motion.image, VK_IMAGE_LAYOUT_GENERAL, readback_px.buffer, 1, &rb);
+                rb.imageExtent = {2, 1, 1};
+                vkCmdCopyImageToBuffer(cmd, camera.image, VK_IMAGE_LAYOUT_GENERAL, readback_cam.buffer, 1, &rb);
             }
             end(cmd);
+        }
+
+        // The camera model against the true motion of the pattern, inside
+        // the frame and away from the still strip (split cases have no single
+        // motion).
+        bool camera_ok = true;
+        if (!c.split) {
+            auto *rows = (float *)readback_cam.data;
+            float worst = 0;
+            for (float y = 64; y <= kSize - 64; y += 32)
+                for (float x = 64; x <= kSize - 64; x += 32) {
+                    float qx = (x - half) / kSize, qy = (y - half) / kSize;
+                    float mx = rows[0] * qx + rows[1] * qy + rows[2];
+                    float my = rows[4] * qx + rows[5] * qy + rows[6];
+                    // The pattern point now at (x, y) moved there from source.
+                    float sx, sy;
+                    source(x, y, sx, sy);
+                    worst = fmaxf(worst, hypotf(mx - (x - sx), my - (y - sy)));
+                }
+            camera_ok = worst <= 3.0f; // block vectors are on a 4 px grid
+            printf("move (%+.0f, %+.0f) zoom %.2f%s: camera model off by %.2f px at most %s\n", dx, dy, c.zoom,
+                   c.hud ? " with a still strip" : "", worst, camera_ok ? "ok" : "FAIL");
+            failures += !camera_ok;
+        }
+        if (camera_only) {
+            // Per pixel, camera mode should tell the still strip from the
+            // rest.
+            auto *pm = (uint16_t *)readback_px.data;
+            const int strip = (int)kLuma * 3 / 4;
+            int good = 0, total = 0;
+            for (int y = 8; y < (int)kLuma - 8; y++)
+                for (int x = 8; x < (int)kLuma - 8; x++) {
+                    if (c.hud && abs(y - strip) < 2)
+                        continue;
+                    bool still = c.hud && y >= strip;
+                    total++;
+                    good += (half_to_float(pm[4 * (y * kLuma + x) + 3]) == 0.0f) == still;
+                }
+            bool split_ok = good >= total * 95 / 100;
+            printf("move (%+.0f, %+.0f) zoom %.2f%s: %d/%d pixels rightly still or moving %s\n", dx, dy, c.zoom,
+                   c.hud ? " with a still strip" : "", good, total, split_ok ? "ok" : "FAIL");
+            failures += !split_ok;
+            continue;
         }
 
         // Blocks away from the borders, where the pattern entered the frame.

@@ -35,5 +35,5 @@ void main()
             n++;
         }
     vec4 c = imageLoad(motion_raw, p);
-    imageStore(motion_out, p, vec4(median9(xs), median9(ys), c.z, 0.0));
+    imageStore(motion_out, p, vec4(median9(xs), median9(ys), c.zw));
 }

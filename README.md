@@ -55,6 +55,21 @@ smear a little where something appears from behind something else, motion is
 found to 4 pixels per real frame, and anything that changes speed shows it a
 frame late.
 
+### Camera mode
+
+Where the motion per block goes wrong, when the camera turns, on tyre smoke,
+or near cars that overtake, the generated frames show it as blocks.
+`FRAMEWARP_MODE=camera` trades that for one smooth motion of the whole
+picture, like the reprojection of VR headsets: after the block search it
+fits a single pan, zoom and roll to all the blocks, letting the blocks that
+disagree with it (the player's car, the HUD, smoke, other cars) count less
+and less over a few rounds, and keeps whichever of two starting points more
+blocks agree with. Then every 4x4 pixels chooses between that motion and no
+motion at all, so the player's car and the HUD stay where they are while the
+road and the scenery move with the camera. There are no blocks, but anything
+that moves on its own, such as another car, moves with the camera in the
+generated frames and catches up at the next real frame.
+
 On the Retroid Pocket 6 in Azimuth (1920x1080 output, `FRAMEWARP_MULT=3`)
 version 0.2.0 cost about 1.5 ms of GPU time per real frame in all (copy 0.2
 ms, motion 0.9 ms, 0.2-0.3 ms per generated frame), kept a steady 60 frames
@@ -82,7 +97,7 @@ per second, and the controls answered as without the layer.
 | `FRAMEWARP_MAX_MULT` | `3` | with `auto`, the most frames shown per real frame |
 | `FRAMEWARP_REFRESH` | `60` | the panel's refresh rate, for `auto` |
 | `FRAMEWARP_FORCE_FIFO` | `1` | forces FIFO presents, so every frame gets its own refresh |
-| `FRAMEWARP_MODE` | `warp` | `warp`; `copy` repeats the last real frame (no motion); `debug` warps and colours the motion it found |
+| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `copy` repeats the last real frame (no motion); `debug` warps and colours the motion it found |
 | `FRAMEWARP_ZERO_BIAS` | `0.05` | 0 to 0.5, how much a block prefers "no motion" over a match that is only slightly better (steadier HUD) |
 | `FRAMEWARP_TINT` | `0` | 0 to 1, tints the generated frames magenta to see them |
 | `FRAMEWARP_LOG` | `~/framewarp.log` | where the measurements go |
@@ -108,7 +123,9 @@ scripts/build.sh out
 It needs CMake, a C++17 compiler, the Vulkan headers and loader, and
 `glslangValidator`. `build/motion_test` runs the motion shaders on a pattern
 moved by known amounts, everywhere or in one half only, and checks the motion
-they find per block and per pixel. CI builds the aarch64
+they find per block and per pixel; it also zooms the pattern and keeps a still
+strip at the bottom, like a HUD, and checks the camera motion and which pixels
+camera mode keeps still. CI builds the aarch64
 package in Fedora 44, the base of ArmadaOS, runs that test and runs vkcube
 through the layer with the validation layer below it, on Mesa's software
 driver.

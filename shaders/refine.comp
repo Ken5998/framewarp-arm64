@@ -6,6 +6,9 @@
 // vectors of its own block, its 8 neighbours and zero, the one that best
 // explains where its 3x3 neighbourhood was in the previous frame. Where a
 // block straddles the car and the road, each side keeps its own motion.
+// In camera mode the choice is between the camera's motion and none, so the
+// player's car and the HUD stay put while the rest follows the camera; w
+// says which (1 = camera).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -29,6 +32,13 @@ void main()
         return;
     if (pc.has_prev == 0) {
         imageStore(pixel_motion_out, p, vec4(0.0));
+        return;
+    }
+    if (pc.mode == 3) {
+        vec2 cam = camera_motion((vec2(p) + 0.5) * float(kScale), vec2(textureSize(frame, 0)));
+        float moving = cost(p, ivec2(round(cam / float(kScale))), size);
+        bool still = cost(p, ivec2(0), size) < moving * (1.0 - pc.zero_bias);
+        imageStore(pixel_motion_out, p, vec4(still ? vec2(0.0) : cam, moving / 9.0, still ? 0.0 : 1.0));
         return;
     }
     ivec2 blocks = textureSize(motion, 0);

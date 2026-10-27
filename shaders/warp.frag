@@ -9,6 +9,8 @@
 //   overlays) stay where they are;
 // - pixels whose source is such a static pixel, or off the screen, keep the
 //   last real frame's pixel instead of dragging the HUD or the edge along.
+// In camera mode the motion is one smooth model for the whole frame, except
+// where the analysis found nothing moved (the player's car, the HUD).
 
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
@@ -26,7 +28,24 @@ void main()
     vec2 px = 1.0 / vec2(textureSize(frame, 0));
     vec3 here = texture(frame, uv).rgb;
     vec2 m = vec2(0.0);
-    if (pc.mode != 0 && pc.has_prev != 0) {
+    if (pc.mode == 3 && pc.has_prev != 0) {
+        vec2 cam = camera_motion(gl_FragCoord.xy, 1.0 / px);
+        ivec2 size = textureSize(pixel_motion, 0);
+        ivec2 base = ivec2(floor(gl_FragCoord.xy / float(kScale) - 0.5));
+        float moving = 0.0;
+        for (int y = 0; y <= 1; y++)
+            for (int x = 0; x <= 1; x++)
+                moving += texelFetch(pixel_motion, clamp(base + ivec2(x, y), ivec2(0), size - 1), 0).w;
+        if (moving == 4.0) {
+            m = cam;
+        } else if (moving > 0.0) {
+            // On the edge between a still part and the rest, per pixel.
+            vec3 dc = abs(here - texture(frame_prev, uv - cam * px).rgb);
+            vec3 dz = abs(here - texture(frame_prev, uv).rgb);
+            if (dc.r + dc.g + dc.b < dz.r + dz.g + dz.b)
+                m = cam;
+        }
+    } else if (pc.mode != 0 && pc.has_prev != 0) {
         // The motion is known per 4x4 pixels; each pixel takes, of the 2x2
         // nearest of those, the vector that best explains its own colour in
         // the previous frame, so edges stay sharp instead of 4x4 steps.
@@ -47,7 +66,10 @@ void main()
     vec3 c = here;
     if (dot(m, m) > 0.0 && !unchanged(uv)) {
         vec2 src = uv - pc.phase * m * px;
-        bool inside = all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0)));
+        // The camera warp moves the whole frame, so near the edges it takes
+        // the edge pixel rather than leaving a seam.
+        bool inside = pc.mode == 3 ||
+                      (all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0))));
         if (inside && !unchanged(src))
             c = texture(frame, src).rgb;
     }

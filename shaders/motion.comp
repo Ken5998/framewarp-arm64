@@ -89,8 +89,14 @@ void main()
     if (t == 0) {
         uint f = pick(kFine * kFine, coarse == ivec2(0) ? 1.0 - pc.zero_bias : 1.0);
         ivec2 d = coarse + ivec2(f % kFine, f / kFine) - kFine / 2;
+        // How much the best match beats the average of its neighbourhood:
+        // near 0 on flat areas (sky, road), where any vector matches.
+        float mean = 0.0;
+        for (int i = 0; i < kFine * kFine; i++)
+            mean += sad[i];
+        mean /= float(kFine * kFine);
         // The block came from origin + d, so it moves by -d per frame.
         imageStore(motion_raw, block,
-                   vec4(vec2(-d * kScale), sad[f] / float(kBlock * kBlock), 0.0));
+                   vec4(vec2(-d * kScale), sad[f], mean - sad[f]) / vec4(1.0, 1.0, vec2(kBlock * kBlock)));
     }
 }

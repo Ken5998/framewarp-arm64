@@ -40,7 +40,7 @@ jobs:
           export DISPLAY=:99 VK_LAYER_PATH=/tmp/explicit:/usr/share/vulkan/explicit_layer.d
           export VK_INSTANCE_LAYERS=VK_LAYER_FRAMEWARP_ci:VK_LAYER_KHRONOS_validation
           export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true
-          for mode in warp debug copy; do
+          for mode in warp debug copy camera; do
             for mult in 2 3 4; do
               run=$mode-$mult
               FRAMEWARP_MODE=$mode FRAMEWARP_MULT=$mult FRAMEWARP_LOG=/tmp/fw-$run.log FRAMEWARP_LOG_EVERY=1 \
