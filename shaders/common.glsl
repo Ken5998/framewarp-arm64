@@ -11,6 +11,9 @@ layout(set = 0, binding = 6) uniform sampler2D motion;    // filtered (linear)
 layout(set = 0, binding = 7) uniform sampler2D luma2_cur;  // luma at 1/16 size
 layout(set = 0, binding = 8) uniform sampler2D luma2_prev;
 layout(set = 0, binding = 9, r32f) uniform writeonly image2D luma2_out;
+layout(set = 0, binding = 10) uniform sampler2D frame_prev; // the real frame before (linear)
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D pixel_motion_out;
+layout(set = 0, binding = 12) uniform sampler2D pixel_motion; // per luma pixel
 
 layout(push_constant) uniform Params {
     vec4 tint;      // rgb, a = strength (0 = off)

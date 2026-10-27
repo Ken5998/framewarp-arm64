@@ -14,6 +14,7 @@
 #include "luma_comp.h"
 #include "motion_comp.h"
 #include "pyramid_comp.h"
+#include "refine_comp.h"
 
 namespace {
 
@@ -214,8 +215,10 @@ int main()
                       make_image(VK_FORMAT_R32_SFLOAT, kLuma2, storage)};
     Image motion_raw = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kMotion, storage);
     Image motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kMotion, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    Image pixel_motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kLuma, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     Buffer upload = make_buffer(kSize * kSize * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     Buffer readback = make_buffer(kMotion * kMotion * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer readback_px = make_buffer(kLuma * kLuma * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
@@ -227,15 +230,15 @@ int main()
 
     // Same bindings as shaders/common.glsl and the layer.
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    constexpr uint32_t kBindings = 10;
-    const VkDescriptorType types[kBindings] = {S, S, S, I, I, I, S, S, S, I};
+    constexpr uint32_t kBindings = 13;
+    const VkDescriptorType types[kBindings] = {S, S, S, I, I, I, S, S, S, I, S, I, S};
     VkDescriptorSetLayoutBinding b[kBindings];
     for (uint32_t i = 0; i < kBindings; i++)
         b[i] = {i, types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, kBindings, b};
     VkDescriptorSetLayout set_layout;
     VK(vkCreateDescriptorSetLayout(device, &dlci, nullptr, &set_layout));
-    VkDescriptorPoolSize ps[2] = {{S, 12}, {I, 8}};
+    VkDescriptorPoolSize ps[2] = {{S, 16}, {I, 10}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 2, 2, ps};
     VkDescriptorPool dpool;
     VK(vkCreateDescriptorPool(device, &dpci, nullptr, &dpool));
@@ -246,11 +249,12 @@ int main()
     for (int c = 0; c < 2; c++) {
         VkImageView views[kBindings] = {frame.view, luma[c].view, luma[1 - c].view, luma[c].view,
                                         motion_raw.view, motion.view, motion.view,
-                                        luma2[c].view, luma2[1 - c].view, luma2[c].view};
+                                        luma2[c].view, luma2[1 - c].view, luma2[c].view,
+                                        frame.view, pixel_motion.view, pixel_motion.view};
         VkDescriptorImageInfo info[kBindings];
         VkWriteDescriptorSet w[kBindings];
         for (uint32_t i = 0; i < kBindings; i++) {
-            bool exact = i == 1 || i == 2 || i == 7 || i == 8;
+            bool exact = i == 1 || i == 2 || i == 7 || i == 8 || i == 12;
             info[i] = {types[i] != S ? VK_NULL_HANDLE : exact ? nearest : linear, views[i], VK_IMAGE_LAYOUT_GENERAL};
             w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[c], i, 0, 1, types[i], &info[i]};
         }
@@ -284,25 +288,35 @@ int main()
     VkPipeline pyramid_p = pipeline(pyramid_comp, sizeof pyramid_comp);
     VkPipeline motion_p = pipeline(motion_comp, sizeof motion_comp);
     VkPipeline filter_p = pipeline(filter_comp, sizeof filter_comp);
+    VkPipeline refine_p = pipeline(refine_comp, sizeof refine_comp);
 
     VkCommandBuffer cmd = begin();
     for (VkImage img : {frame.image, luma[0].image, luma[1].image, luma2[0].image, luma2[1].image,
-                        motion_raw.image, motion.image})
+                        motion_raw.image, motion.image, pixel_motion.image})
         to_general(cmd, img);
     end(cmd);
 
     // Each case: the pattern moves by (dx, dy) frame pixels between the two
-    // frames; the expected result is that motion, to the 4 pixel grid.
-    const int cases[][2] = {{0, 0}, {12, -8}, {-20, 4}, {30, 18}, {-60, -40}};
+    // frames, everywhere or (split) only in the left half while the right
+    // half stays still. The blocks should find that motion to the 4 pixel
+    // grid, and the per pixel motion should follow the split.
+    struct Case {
+        int dx, dy;
+        bool split;
+    };
+    const Case cases[] = {{0, 0, false},   {12, -8, false}, {-20, 4, false}, {30, 18, false},
+                          {-60, -40, false}, {24, 8, true},   {-36, 0, true}};
     int failures = 0;
-    for (auto &c : cases) {
-        float dx = (float)c[0], dy = (float)c[1];
+    for (const Case &c : cases) {
+        float dx = (float)c.dx, dy = (float)c.dy;
+        auto moving = [&](float x) { return !c.split || x < kSize / 2; };
         for (int f = 0; f < 2; f++) {
             auto *px = (uint8_t *)upload.data;
             for (uint32_t y = 0; y < kSize; y++)
                 for (uint32_t x = 0; x < kSize; x++) {
                     // Frame 1 shows the pattern moved by (dx, dy).
-                    float v = noise((float)x - (f ? dx : 0) + 1000, (float)y - (f ? dy : 0) + 1000);
+                    bool shift = f && moving((float)x);
+                    float v = noise((float)x - (shift ? dx : 0) + 1000, (float)y - (shift ? dy : 0) + 1000);
                     uint8_t g = (uint8_t)(v * 255.0f);
                     px[0] = px[1] = px[2] = g;
                     px[3] = 255;
@@ -329,31 +343,58 @@ int main()
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, filter_p);
                 vkCmdDispatch(cmd, (kMotion + 7) / 8, (kMotion + 7) / 8, 1);
                 barrier(cmd);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, refine_p);
+                vkCmdDispatch(cmd, kLuma / 8, kLuma / 8, 1);
+                barrier(cmd);
                 VkBufferImageCopy rb{};
                 rb.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 rb.imageExtent = {kMotion, kMotion, 1};
                 vkCmdCopyImageToBuffer(cmd, motion.image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &rb);
+                rb.imageExtent = {kLuma, kLuma, 1};
+                vkCmdCopyImageToBuffer(cmd, pixel_motion.image, VK_IMAGE_LAYOUT_GENERAL, readback_px.buffer, 1, &rb);
             }
             end(cmd);
         }
 
         // Blocks away from the borders, where the pattern entered the frame.
-        auto *m = (uint16_t *)readback.data;
+        bool ok = true;
+        if (!c.split) {
+            auto *m = (uint16_t *)readback.data;
+            int good = 0, total = 0;
+            float sx = 0, sy = 0;
+            for (uint32_t y = 3; y < kMotion - 3; y++)
+                for (uint32_t x = 3; x < kMotion - 3; x++) {
+                    uint16_t *t = m + 4 * (y * kMotion + x);
+                    float mx = half_to_float(t[0]), my = half_to_float(t[1]);
+                    sx += mx;
+                    sy += my;
+                    total++;
+                    good += fabsf(mx - dx) <= 2.0f && fabsf(my - dy) <= 2.0f;
+                }
+            ok = good >= total * 95 / 100;
+            printf("move (%+.0f, %+.0f): mean block motion (%+.1f, %+.1f), %d/%d blocks within 2 px %s\n", dx, dy,
+                   sx / total, sy / total, good, total, ok ? "ok" : "FAIL");
+        }
+
+        // Pixels away from the borders and the split.
+        auto *pm = (uint16_t *)readback_px.data;
+        int margin = 3 + (abs(c.dx) > abs(c.dy) ? abs(c.dx) : abs(c.dy)) / 4;
         int good = 0, total = 0;
-        float sx = 0, sy = 0;
-        for (uint32_t y = 3; y < kMotion - 3; y++)
-            for (uint32_t x = 3; x < kMotion - 3; x++) {
-                uint16_t *t = m + 4 * (y * kMotion + x);
+        for (int y = margin; y < (int)kLuma - margin; y++)
+            for (int x = margin; x < (int)kLuma - margin; x++) {
+                if (c.split && abs(x - (int)kLuma / 2) < 2)
+                    continue;
+                uint16_t *t = pm + 4 * (y * kLuma + x);
                 float mx = half_to_float(t[0]), my = half_to_float(t[1]);
-                sx += mx;
-                sy += my;
+                bool moves = moving((float)(x * 4));
+                float ex = moves ? dx : 0, ey = moves ? dy : 0;
                 total++;
-                good += fabsf(mx - dx) <= 2.0f && fabsf(my - dy) <= 2.0f;
+                good += fabsf(mx - ex) <= 2.0f && fabsf(my - ey) <= 2.0f;
             }
-        bool ok = good >= total * 95 / 100;
-        printf("move (%+.0f, %+.0f): mean motion (%+.1f, %+.1f), %d/%d blocks within 2 px %s\n", dx, dy,
-               sx / total, sy / total, good, total, ok ? "ok" : "FAIL");
-        failures += !ok;
+        bool pixels_ok = good >= total * 95 / 100;
+        printf("move (%+.0f, %+.0f)%s: %d/%d pixels within 2 px %s\n", dx, dy, c.split ? " left half only" : "",
+               good, total, pixels_ok ? "ok" : "FAIL");
+        failures += !ok + !pixels_ok;
     }
     vkDeviceWaitIdle(device);
     return failures ? 1 : 0;

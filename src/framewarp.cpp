@@ -33,6 +33,7 @@
 #include "luma_comp.h"
 #include "motion_comp.h"
 #include "pyramid_comp.h"
+#include "refine_comp.h"
 #include "warp_frag.h"
 
 #define FW_EXPORT extern "C" __attribute__((visibility("default")))
@@ -280,6 +281,7 @@ struct SwapchainData {
     Image luma2[2];      // and 1/16 size
     Image motion_raw;    // block motion, one texel per 32x32 frame pixels
     Image motion;        // the same after the median filter
+    Image pixel_motion;  // per luma pixel, picked among the block vectors
     VkExtent2D luma_extent{}, luma2_extent{}, motion_extent{};
     bool initialized = false;
     int cur = 0;         // history slot of the last real frame
@@ -296,6 +298,7 @@ struct SwapchainData {
     VkPipeline pyramid_pipeline = VK_NULL_HANDLE;
     VkPipeline motion_pipeline = VK_NULL_HANDLE;
     VkPipeline filter_pipeline = VK_NULL_HANDLE;
+    VkPipeline refine_pipeline = VK_NULL_HANDLE;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
     Slot slots[kRing];
     int next_slot = 0;
@@ -481,7 +484,7 @@ void destroy_resources(SwapchainData *sc)
     for (auto fb : sc->framebuffers) if (fb) d->DestroyFramebuffer(dv, fb, nullptr);
     for (auto v : sc->views) if (v) d->DestroyImageView(dv, v, nullptr);
     for (VkPipeline p : {sc->pipeline, sc->luma_pipeline, sc->pyramid_pipeline, sc->motion_pipeline,
-                         sc->filter_pipeline})
+                         sc->filter_pipeline, sc->refine_pipeline})
         if (p) d->DestroyPipeline(dv, p, nullptr);
     if (sc->pass) d->DestroyRenderPass(dv, sc->pass, nullptr);
     if (sc->layout) d->DestroyPipelineLayout(dv, sc->layout, nullptr);
@@ -490,14 +493,14 @@ void destroy_resources(SwapchainData *sc)
     if (sc->sampler) d->DestroySampler(dv, sc->sampler, nullptr);
     if (sc->sampler_nearest) d->DestroySampler(dv, sc->sampler_nearest, nullptr);
     for (Image *img : {&sc->history[0], &sc->history[1], &sc->luma[0], &sc->luma[1], &sc->luma2[0], &sc->luma2[1],
-                        &sc->motion_raw, &sc->motion}) {
+                        &sc->motion_raw, &sc->motion, &sc->pixel_motion}) {
         if (img->view) d->DestroyImageView(dv, img->view, nullptr);
         if (img->image) d->DestroyImage(dv, img->image, nullptr);
         if (img->memory) d->FreeMemory(dv, img->memory, nullptr);
         *img = Image{};
     }
     sc->pipeline = sc->luma_pipeline = sc->pyramid_pipeline = sc->motion_pipeline = sc->filter_pipeline =
-        VK_NULL_HANDLE;
+        sc->refine_pipeline = VK_NULL_HANDLE;
     sc->pass = VK_NULL_HANDLE;
     sc->layout = VK_NULL_HANDLE;
     sc->pool = VK_NULL_HANDLE;
@@ -595,7 +598,8 @@ bool create_resources(SwapchainData *sc, uint32_t family)
             return false;
     }
     if (!create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion_raw) ||
-        !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion))
+        !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion) ||
+        !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->luma_extent, storage, sc->pixel_motion))
         return false;
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -608,7 +612,8 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     // The bindings of shaders/common.glsl.
     const VkDescriptorType sampled = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     const VkDescriptorType image = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    const VkDescriptorType types[] = {sampled, sampled, sampled, image, image, image, sampled, sampled, sampled, image};
+    const VkDescriptorType types[] = {sampled, sampled, sampled, image, image, image, sampled,
+                                      sampled, sampled, image, sampled, image, sampled};
     constexpr uint32_t kBindings = sizeof types / sizeof types[0];
     VkDescriptorSetLayoutBinding b[kBindings];
     for (uint32_t i = 0; i < kBindings; i++)
@@ -617,7 +622,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     dlci.bindingCount = kBindings;
     dlci.pBindings = b;
     CHECK(d->CreateDescriptorSetLayout(dv, &dlci, nullptr, &sc->set_layout));
-    VkDescriptorPoolSize ps[2] = {{sampled, 12}, {image, 8}};
+    VkDescriptorPoolSize ps[2] = {{sampled, 16}, {image, 10}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 2;
     dpci.poolSizeCount = 2;
@@ -633,11 +638,12 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         const VkImageView views[kBindings] = {sc->history[c].view, sc->luma[c].view, sc->luma[1 - c].view,
                                               sc->luma[c].view, sc->motion_raw.view, sc->motion.view,
                                               sc->motion.view, sc->luma2[c].view, sc->luma2[1 - c].view,
-                                              sc->luma2[c].view};
+                                              sc->luma2[c].view, sc->history[1 - c].view, sc->pixel_motion.view,
+                                              sc->pixel_motion.view};
         VkDescriptorImageInfo info[kBindings];
         VkWriteDescriptorSet w[kBindings];
         for (uint32_t i = 0; i < kBindings; i++) {
-            VkSampler sampler = types[i] != sampled ? VK_NULL_HANDLE : (i == 1 || i == 2 || i == 7 || i == 8)
+            VkSampler sampler = types[i] != sampled ? VK_NULL_HANDLE : (i == 1 || i == 2 || i == 7 || i == 8 || i == 12)
                                                                                            ? sc->sampler_nearest
                                                                                            : sc->sampler;
             info[i] = {sampler, views[i], VK_IMAGE_LAYOUT_GENERAL};
@@ -662,7 +668,8 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     if (!create_compute(sc, luma_comp, sizeof luma_comp, &sc->luma_pipeline) ||
         !create_compute(sc, pyramid_comp, sizeof pyramid_comp, &sc->pyramid_pipeline) ||
         !create_compute(sc, motion_comp, sizeof motion_comp, &sc->motion_pipeline) ||
-        !create_compute(sc, filter_comp, sizeof filter_comp, &sc->filter_pipeline))
+        !create_compute(sc, filter_comp, sizeof filter_comp, &sc->filter_pipeline) ||
+        !create_compute(sc, refine_comp, sizeof refine_comp, &sc->refine_pipeline))
         return false;
 
     VkAttachmentDescription att{};
@@ -940,8 +947,8 @@ void memory_barrier(DeviceData *d, VkCommandBuffer cmd, VkPipelineStageFlags src
     d->CmdPipelineBarrier(cmd, src, dst, 0, 1, &b, 0, nullptr, 0, nullptr);
 }
 
-// Luma pyramid of the new real frame, motion against the previous one,
-// median filter. Runs right after the real frame is presented.
+// Luma pyramid of the new real frame, block motion against the previous
+// one, median filter, then motion per luma pixel. Runs right after the real frame is presented.
 VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
 {
     DeviceData *d = sc->dev;
@@ -970,6 +977,9 @@ VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
     memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->filter_pipeline);
     d->CmdDispatch(cmd, (sc->motion_extent.width + 7) / 8, (sc->motion_extent.height + 7) / 8, 1);
+    memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
+    d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->refine_pipeline);
+    d->CmdDispatch(cmd, (sc->luma_extent.width + 7) / 8, (sc->luma_extent.height + 7) / 8, 1);
     memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
 
     if (sc->timestamps)
@@ -1088,7 +1098,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     if (!sc->initialized) {
         for (Image *img : {&sc->history[0], &sc->history[1], &sc->luma[0], &sc->luma[1], &sc->luma2[0], &sc->luma2[1],
-                        &sc->motion_raw, &sc->motion})
+                        &sc->motion_raw, &sc->motion, &sc->pixel_motion})
             image_barrier(d, cmd, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, shaders | VK_PIPELINE_STAGE_TRANSFER_BIT);

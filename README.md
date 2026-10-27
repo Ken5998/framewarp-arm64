@@ -16,8 +16,9 @@ is too much for a racing game.
 framewarp extrapolates instead: the real frame goes to the screen as soon as
 it is done, and the extra frames that follow it are made from the frames the
 game has already rendered. Nothing waits for a future frame, so the layer adds
-no frame of latency, only the wait for the next refresh that v-sync has. The generated frames are queued on the GPU right behind
-the real frame, before the game's next frame, so they don't wait for it.
+no frame of latency, only the wait for the next refresh that v-sync has. The
+generated frames are queued on the GPU right behind the real frame, before the
+game's next frame, so they don't wait for it.
 
 ## How it works
 
@@ -28,23 +29,31 @@ On every present of the game the layer:
 3. estimates the motion between this frame and the previous one: block
    matching on a 1/4 size luma copy, with a coarse search on a 1/16 size copy
    first (up to about 80 pixels per real frame), then a 3x3 median filter
-   over the blocks (one per 32x32 pixels);
+   over the blocks (one per 32x32 pixels); then every 4x4 pixels pick, among
+   the vectors of their block, its neighbours and zero, the one that matches
+   them best, so the edge of the car and the road behind it each keep their
+   own motion;
 4. acquires `FRAMEWARP_MULT - 1` more images from the same swapchain and
    draws in each the last real frame pushed forward along that motion, a
    third and two thirds of a real frame ahead with `FRAMEWARP_MULT=3`, then
-   presents them.
+   presents them. Pixels that did not change between the last two real
+   frames (the HUD) stay where they are, and pixels whose source would be
+   off the screen or on the HUD keep the real frame's pixel instead of
+   smearing it.
 
 The swapchain runs in FIFO mode, so each present shows for one refresh: on a
 60 Hz panel `FRAMEWARP_MULT=3` shows 60 frames per second from 20 real ones
 and holds the game at 20.
 
-Because the motion comes from the picture only, the generated frames smear
-where something appears from behind something else, at the screen edges and
-around the HUD, and anything that changes speed shows it a frame late.
+Because the motion comes from the picture only, the generated frames still
+smear a little where something appears from behind something else, motion is
+found to 4 pixels per real frame, and anything that changes speed shows it a
+frame late.
 
-On the Retroid Pocket 6 in Azimuth (1920x1080 output) the first version of
-the layer, which drew plain copies, cost 0.2 ms per real frame plus 0.15-0.3
-ms per generated frame and kept a steady 60 frames per second.
+On the Retroid Pocket 6 in Azimuth (1920x1080 output, `FRAMEWARP_MULT=3`)
+version 0.2.0 cost about 1.5 ms of GPU time per real frame in all (copy 0.2
+ms, motion 0.9 ms, 0.2-0.3 ms per generated frame), kept a steady 60 frames
+per second, and the controls answered as without the layer.
 
 ## Install on ArmadaOS
 
@@ -90,7 +99,8 @@ scripts/build.sh out
 
 It needs CMake, a C++17 compiler, the Vulkan headers and loader, and
 `glslangValidator`. `build/motion_test` runs the motion shaders on a pattern
-moved by known amounts and checks what they find. CI builds the aarch64
+moved by known amounts, everywhere or in one half only, and checks the motion
+they find per block and per pixel. CI builds the aarch64
 package in Fedora 44, the base of ArmadaOS, runs that test and runs vkcube
 through the layer with the validation layer below it, on Mesa's software
 driver.

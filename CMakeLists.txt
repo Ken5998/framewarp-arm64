@@ -9,7 +9,7 @@ find_package(Vulkan REQUIRED)
 find_program(GLSLANG glslangValidator REQUIRED)
 
 set(SHADER_HEADERS)
-foreach(shader fullscreen.vert warp.frag luma.comp pyramid.comp motion.comp filter.comp)
+foreach(shader fullscreen.vert warp.frag luma.comp pyramid.comp motion.comp filter.comp refine.comp)
     string(REPLACE "." "_" var ${shader})
     set(out ${CMAKE_BINARY_DIR}/shaders/${var}.h)
     add_custom_command(

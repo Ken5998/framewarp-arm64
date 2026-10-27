@@ -1,0 +1,50 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Motion per luma pixel (4x4 frame pixels): each pixel picks, among the
+// vectors of its own block, its 8 neighbours and zero, the one that best
+// explains where its 3x3 neighbourhood was in the previous frame. Where a
+// block straddles the car and the road, each side keeps its own motion.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+float cost(ivec2 p, ivec2 d, ivec2 size)
+{
+    float s = 0.0;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+            ivec2 r = clamp(q - d, ivec2(0), size - 1);
+            s += abs(texelFetch(luma_cur, q, 0).r - texelFetch(luma_prev, r, 0).r);
+        }
+    return s;
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(luma_cur, 0);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    if (pc.has_prev == 0) {
+        imageStore(pixel_motion_out, p, vec4(0.0));
+        return;
+    }
+    ivec2 blocks = textureSize(motion, 0);
+    ivec2 block = p / kBlock;
+
+    vec2 best = vec2(0.0);
+    float best_cost = cost(p, ivec2(0), size) * (1.0 - pc.zero_bias);
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            vec2 m = texelFetch(motion, clamp(block + ivec2(x, y), ivec2(0), blocks - 1), 0).xy;
+            // Motion is in frame pixels and a multiple of kScale.
+            float c = cost(p, ivec2(round(m / float(kScale))), size);
+            if (c < best_cost) {
+                best_cost = c;
+                best = m;
+            }
+        }
+    imageStore(pixel_motion_out, p, vec4(best, best_cost / 9.0, 0.0));
+}
