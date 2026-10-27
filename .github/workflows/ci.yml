@@ -1,0 +1,50 @@
+name: CI
+
+# Builds the layer on an aarch64 runner in Fedora 44, the base of ArmadaOS,
+# runs vkcube through it on Mesa's software Vulkan driver with the validation
+# layer below it, and keeps the package as an artifact.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  layer:
+    runs-on: ubuntu-24.04-arm
+    container: registry.fedoraproject.org/fedora:44
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf -y install gcc-c++ cmake make vulkan-headers vulkan-loader-devel glslang tar gzip \
+            mesa-vulkan-drivers vulkan-tools vulkan-validation-layers xorg-x11-server-Xvfb
+      - uses: actions/checkout@v5
+      - name: Check the scripts
+        run: bash -n scripts/*.sh
+      - name: Build
+        run: scripts/build.sh out
+      - name: Run vkcube through the layer
+        run: |
+          tar -xzf out/framewarp-*.tar.gz -C /tmp
+          /tmp/framewarp/install.sh
+          Xvfb :99 -screen 0 1280x720x24 &
+          sleep 2
+          # The layer is implicit; a second copy enabled explicitly sits above
+          # the validation layer, so validation checks the layer's own calls.
+          mkdir -p /tmp/explicit
+          sed 's/VK_LAYER_FRAMEWARP_frame_generation/VK_LAYER_FRAMEWARP_ci/' \
+            ~/.local/share/vulkan/implicit_layer.d/VkLayer_framewarp.json > /tmp/explicit/framewarp.json
+          export DISPLAY=:99 VK_LAYER_PATH=/tmp/explicit:/usr/share/vulkan/explicit_layer.d
+          export VK_INSTANCE_LAYERS=VK_LAYER_FRAMEWARP_ci:VK_LAYER_KHRONOS_validation
+          export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true
+          for mult in 2 3 4; do
+            FRAMEWARP_MULT=$mult FRAMEWARP_TAPS=9 FRAMEWARP_LOG=/tmp/fw-$mult.log FRAMEWARP_LOG_EVERY=1 \
+              timeout 20 vkcube --c 300 > /tmp/vkcube-$mult.txt 2>&1
+            cat /tmp/vkcube-$mult.txt
+            if grep -q -i -E "validation (error|warning)|VUID" /tmp/vkcube-$mult.txt; then exit 1; fi
+            grep -q "^real" /tmp/fw-$mult.log
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framewarp
+          path: out/*.tar.gz

@@ -1,0 +1,38 @@
+name: Release notes
+
+# Rewrites a published release's notes with the changes since the previous
+# release (scripts/release-notes.sh), keeping its install instructions. The
+# release workflow writes them the same way for new releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (default the latest release)
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Rewrite the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          tag="${TAG:-$(gh release view --json tagName --jq .tagName)}"
+          body="$(gh release view "$tag" --json body --jq .body)"
+          scripts/release-notes.sh "$tag" "$tag" > notes.md
+          if printf '%s\n' "$body" | grep -q '^## Install'; then
+            printf '%s\n' "$body" | awk '/^## Install/ { keep = 1 } keep' >> notes.md
+          else
+            printf '## Install\n\n%s\n' "$body" >> notes.md
+          fi
+          cat notes.md
+          gh release edit "$tag" --notes-file notes.md
