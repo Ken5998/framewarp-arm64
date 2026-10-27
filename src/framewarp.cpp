@@ -1,12 +1,13 @@
 // framewarp: Vulkan layer that shows extra frames between the frames a game
-// renders. Stage 1 is a probe: the extra frames are copies of the last real
-// frame, and the layer measures what they cost on the GPU and whether they
-// reach the display on time.
+// renders, made by pushing the last real frame forward along its motion
+// (extrapolation), so nothing waits for a future frame.
 //
 // How it works: on every vkQueuePresentKHR of the game the layer copies the
-// game's image into its own history image, presents the game's image, then
-// acquires (multiplier - 1) more images from the same swapchain, draws the
-// history image into each and presents them. With FIFO each present takes
+// game's image into its own history image, estimates the motion between it
+// and the previous real frame (block matching on a 1/4 size luma copy),
+// presents the game's image, then acquires (multiplier - 1) more images from
+// the same swapchain, draws the warped history image into each and presents
+// them. With FIFO each present takes
 // one vblank, so on a 60 Hz panel multiplier 3 shows 60 frames per second
 // out of 20 real ones. The generated frames are queued right behind the real
 // frame, so they never wait behind the next frame's GPU work.
@@ -27,8 +28,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "filter_comp.h"
 #include "fullscreen_vert.h"
-#include "probe_frag.h"
+#include "luma_comp.h"
+#include "motion_comp.h"
+#include "pyramid_comp.h"
+#include "warp_frag.h"
 
 #define FW_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -42,9 +47,9 @@ constexpr int kRing = 8;
 struct Config {
     int multiplier = 2;
     bool force_fifo = true;
-    int taps = 1;
+    int mode = 1; // 0 = copy, 1 = warp, 2 = warp + motion overlay
+    float zero_bias = 0.05f;
     float tint = 0.0f;
-    float shift = 0.0f;
     double log_every = 2.0;
     std::string log_path;
 };
@@ -71,9 +76,10 @@ void load_config()
     std::call_once(once, [] {
         g_cfg.multiplier = std::clamp(env_int("FRAMEWARP_MULT", 2), 1, kMaxMultiplier);
         g_cfg.force_fifo = env_int("FRAMEWARP_FORCE_FIFO", 1) != 0;
-        g_cfg.taps = env_int("FRAMEWARP_TAPS", 1) > 1 ? 9 : 1;
+        if (const char *m = getenv("FRAMEWARP_MODE"); m && *m)
+            g_cfg.mode = !strcmp(m, "copy") ? 0 : !strcmp(m, "debug") ? 2 : 1;
+        g_cfg.zero_bias = std::clamp(env_float("FRAMEWARP_ZERO_BIAS", 0.05f), 0.0f, 0.5f);
         g_cfg.tint = std::clamp(env_float("FRAMEWARP_TINT", 0.0f), 0.0f, 1.0f);
-        g_cfg.shift = env_float("FRAMEWARP_SHIFT", 0.0f);
         g_cfg.log_every = std::max(0.5f, env_float("FRAMEWARP_LOG_EVERY", 2.0f));
         if (const char *p = getenv("FRAMEWARP_LOG"); p && *p)
             g_cfg.log_path = p;
@@ -142,6 +148,7 @@ template <typename T> void *key(T obj) { return *reinterpret_cast<void **>(obj);
     X(CmdBindDescriptorSets)                                                   \
     X(CmdPushConstants)                                                        \
     X(CmdDraw)                                                                 \
+    X(CmdDispatch)                                                             \
     X(CmdSetViewport)                                                          \
     X(CmdSetScissor)                                                           \
     X(CmdWriteTimestamp)                                                       \
@@ -170,6 +177,7 @@ template <typename T> void *key(T obj) { return *reinterpret_cast<void **>(obj);
     X(CreateShaderModule)                                                      \
     X(DestroyShaderModule)                                                     \
     X(CreateGraphicsPipelines)                                                 \
+    X(CreateComputePipelines)                                                  \
     X(DestroyPipeline)                                                         \
     X(CreateRenderPass)                                                        \
     X(DestroyRenderPass)                                                       \
@@ -210,8 +218,12 @@ struct QueueData {
 };
 
 // One set of objects per in-flight present cycle.
+// cmd[0] copies the real frame, cmd[1..] draw the generated frames and
+// cmd[kAnalysis] estimates the motion. Timestamp pair i belongs to cmd[i].
+constexpr int kAnalysis = kMaxMultiplier;
+
 struct Slot {
-    VkCommandBuffer cmd[kMaxMultiplier] = {};
+    VkCommandBuffer cmd[kMaxMultiplier + 1] = {};
     VkSemaphore copy_done = VK_NULL_HANDLE;
     VkSemaphore acquired[kMaxMultiplier] = {};
     VkSemaphore drawn[kMaxMultiplier] = {};
@@ -228,9 +240,24 @@ struct Stats {
     int shown = 0;
     int missed = 0;
     double interval_max = 0;
-    double copy_ms = 0, gen_ms = 0, gen_ms_max = 0;
-    int copy_n = 0, gen_n = 0;
+    double copy_ms = 0, gen_ms = 0, gen_ms_max = 0, motion_ms = 0;
+    int copy_n = 0, gen_n = 0, motion_n = 0;
     double extra_cpu_ms = 0, extra_cpu_ms_max = 0;
+};
+
+struct Image {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
+// Must match Params in shaders/common.glsl.
+struct PushConstants {
+    float tint[4];
+    float phase;
+    int32_t mode;
+    int32_t has_prev;
+    float zero_bias;
 };
 
 struct SwapchainData {
@@ -247,17 +274,28 @@ struct SwapchainData {
     bool broken = false;
     uint32_t family = 0;
 
-    VkImage history = VK_NULL_HANDLE;
-    VkDeviceMemory history_mem = VK_NULL_HANDLE;
-    VkImageView history_view = VK_NULL_HANDLE;
-    bool history_valid = false;
-    VkSampler sampler = VK_NULL_HANDLE;
+    // All in VK_IMAGE_LAYOUT_GENERAL once initialized.
+    Image history[2];    // real frames, by parity
+    Image luma[2];       // their luma, 1/4 size
+    Image luma2[2];      // and 1/16 size
+    Image motion_raw;    // block motion, one texel per 32x32 frame pixels
+    Image motion;        // the same after the median filter
+    VkExtent2D luma_extent{}, luma2_extent{}, motion_extent{};
+    bool initialized = false;
+    int cur = 0;         // history slot of the last real frame
+    bool has_prev = false;
+    VkSampler sampler = VK_NULL_HANDLE;         // linear
+    VkSampler sampler_nearest = VK_NULL_HANDLE; // for formats without linear filtering
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2] = {};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkRenderPass pass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline luma_pipeline = VK_NULL_HANDLE;
+    VkPipeline pyramid_pipeline = VK_NULL_HANDLE;
+    VkPipeline motion_pipeline = VK_NULL_HANDLE;
+    VkPipeline filter_pipeline = VK_NULL_HANDLE;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
     Slot slots[kRing];
     int next_slot = 0;
@@ -371,8 +409,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkD
     VkPhysicalDeviceProperties props;
     inst->GetPhysicalDeviceProperties(physical, &props);
     data->timestamp_period = props.limits.timestampPeriod;
-    logf("device %s, multiplier %d, taps %d, force_fifo %d", props.deviceName,
-         g_cfg.multiplier, g_cfg.taps, g_cfg.force_fifo);
+    logf("device %s, multiplier %d, mode %d, zero bias %.2f, force_fifo %d", props.deviceName,
+         g_cfg.multiplier, g_cfg.mode, g_cfg.zero_bias, g_cfg.force_fifo);
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_devices[key(*out)] = std::move(data);
@@ -442,15 +480,30 @@ void destroy_resources(SwapchainData *sc)
     if (sc->cmd_pool) d->DestroyCommandPool(dv, sc->cmd_pool, nullptr);
     for (auto fb : sc->framebuffers) if (fb) d->DestroyFramebuffer(dv, fb, nullptr);
     for (auto v : sc->views) if (v) d->DestroyImageView(dv, v, nullptr);
-    if (sc->pipeline) d->DestroyPipeline(dv, sc->pipeline, nullptr);
+    for (VkPipeline p : {sc->pipeline, sc->luma_pipeline, sc->pyramid_pipeline, sc->motion_pipeline,
+                         sc->filter_pipeline})
+        if (p) d->DestroyPipeline(dv, p, nullptr);
     if (sc->pass) d->DestroyRenderPass(dv, sc->pass, nullptr);
     if (sc->layout) d->DestroyPipelineLayout(dv, sc->layout, nullptr);
     if (sc->pool) d->DestroyDescriptorPool(dv, sc->pool, nullptr);
     if (sc->set_layout) d->DestroyDescriptorSetLayout(dv, sc->set_layout, nullptr);
     if (sc->sampler) d->DestroySampler(dv, sc->sampler, nullptr);
-    if (sc->history_view) d->DestroyImageView(dv, sc->history_view, nullptr);
-    if (sc->history) d->DestroyImage(dv, sc->history, nullptr);
-    if (sc->history_mem) d->FreeMemory(dv, sc->history_mem, nullptr);
+    if (sc->sampler_nearest) d->DestroySampler(dv, sc->sampler_nearest, nullptr);
+    for (Image *img : {&sc->history[0], &sc->history[1], &sc->luma[0], &sc->luma[1], &sc->luma2[0], &sc->luma2[1],
+                        &sc->motion_raw, &sc->motion}) {
+        if (img->view) d->DestroyImageView(dv, img->view, nullptr);
+        if (img->image) d->DestroyImage(dv, img->image, nullptr);
+        if (img->memory) d->FreeMemory(dv, img->memory, nullptr);
+        *img = Image{};
+    }
+    sc->pipeline = sc->luma_pipeline = sc->pyramid_pipeline = sc->motion_pipeline = sc->filter_pipeline =
+        VK_NULL_HANDLE;
+    sc->pass = VK_NULL_HANDLE;
+    sc->layout = VK_NULL_HANDLE;
+    sc->pool = VK_NULL_HANDLE;
+    sc->set_layout = VK_NULL_HANDLE;
+    sc->sampler = sc->sampler_nearest = VK_NULL_HANDLE;
+    sc->initialized = sc->has_prev = false;
     sc->framebuffers.clear();
     sc->views.clear();
     sc->cmd_pool = VK_NULL_HANDLE;
@@ -466,78 +519,151 @@ void destroy_resources(SwapchainData *sc)
         }                                                                      \
     } while (0)
 
-bool create_resources(SwapchainData *sc, uint32_t family)
+bool create_image(DeviceData *d, VkFormat format, VkExtent2D extent, VkImageUsageFlags usage, Image &img)
 {
-    DeviceData *d = sc->dev;
     VkDevice dv = d->device;
-    sc->family = family;
-
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = sc->format;
-    ici.extent = {sc->extent.width, sc->extent.height, 1};
+    ici.format = format;
+    ici.extent = {extent.width, extent.height, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.usage = usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    CHECK(d->CreateImage(dv, &ici, nullptr, &sc->history));
+    CHECK(d->CreateImage(dv, &ici, nullptr, &img.image));
     VkMemoryRequirements req;
-    d->GetImageMemoryRequirements(dv, sc->history, &req);
+    d->GetImageMemoryRequirements(dv, img.image, &req);
     int type = find_memory(d, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (type < 0)
         type = find_memory(d, req.memoryTypeBits, 0);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = (uint32_t)type;
-    CHECK(d->AllocateMemory(dv, &mai, nullptr, &sc->history_mem));
-    CHECK(d->BindImageMemory(dv, sc->history, sc->history_mem, 0));
-
+    CHECK(d->AllocateMemory(dv, &mai, nullptr, &img.memory));
+    CHECK(d->BindImageMemory(dv, img.image, img.memory, 0));
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = sc->format;
+    vci.format = format;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vci.image = sc->history;
-    CHECK(d->CreateImageView(dv, &vci, nullptr, &sc->history_view));
+    vci.image = img.image;
+    CHECK(d->CreateImageView(dv, &vci, nullptr, &img.view));
+    return true;
+}
+
+bool create_shader(DeviceData *d, const uint32_t *code, size_t size, VkShaderModule *out)
+{
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = size;
+    smci.pCode = code;
+    CHECK(d->CreateShaderModule(d->device, &smci, nullptr, out));
+    return true;
+}
+
+bool create_compute(SwapchainData *sc, const uint32_t *code, size_t size, VkPipeline *out)
+{
+    DeviceData *d = sc->dev;
+    VkShaderModule cs;
+    if (!create_shader(d, code, size, &cs))
+        return false;
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                  cs, "main", nullptr};
+    cpci.layout = sc->layout;
+    VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &cpci, nullptr, out);
+    d->DestroyShaderModule(d->device, cs, nullptr);
+    CHECK(r);
+    return true;
+}
+
+bool create_resources(SwapchainData *sc, uint32_t family)
+{
+    DeviceData *d = sc->dev;
+    VkDevice dv = d->device;
+    sc->family = family;
+
+    sc->luma_extent = {(sc->extent.width + 3) / 4, (sc->extent.height + 3) / 4};
+    sc->luma2_extent = {(sc->luma_extent.width + 3) / 4, (sc->luma_extent.height + 3) / 4};
+    sc->motion_extent = {(sc->luma_extent.width + 7) / 8, (sc->luma_extent.height + 7) / 8};
+    const VkImageUsageFlags storage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    for (int i = 0; i < 2; i++) {
+        if (!create_image(d, sc->format, sc->extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          sc->history[i]) ||
+            !create_image(d, VK_FORMAT_R32_SFLOAT, sc->luma_extent, storage, sc->luma[i]) ||
+            !create_image(d, VK_FORMAT_R32_SFLOAT, sc->luma2_extent, storage, sc->luma2[i]))
+            return false;
+    }
+    if (!create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion_raw) ||
+        !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion))
+        return false;
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     CHECK(d->CreateSampler(dv, &sci, nullptr, &sc->sampler));
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    CHECK(d->CreateSampler(dv, &sci, nullptr, &sc->sampler_nearest));
 
-    VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    // The bindings of shaders/common.glsl.
+    const VkDescriptorType sampled = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    const VkDescriptorType image = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const VkDescriptorType types[] = {sampled, sampled, sampled, image, image, image, sampled, sampled, sampled, image};
+    constexpr uint32_t kBindings = sizeof types / sizeof types[0];
+    VkDescriptorSetLayoutBinding b[kBindings];
+    for (uint32_t i = 0; i < kBindings; i++)
+        b[i] = {i, types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dlci.bindingCount = 1;
-    dlci.pBindings = &b;
+    dlci.bindingCount = kBindings;
+    dlci.pBindings = b;
     CHECK(d->CreateDescriptorSetLayout(dv, &dlci, nullptr, &sc->set_layout));
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolSize ps[2] = {{sampled, 12}, {image, 8}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci.maxSets = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &ps;
+    dpci.maxSets = 2;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = ps;
     CHECK(d->CreateDescriptorPool(dv, &dpci, nullptr, &sc->pool));
+    VkDescriptorSetLayout layouts[2] = {sc->set_layout, sc->set_layout};
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = sc->pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &sc->set_layout;
-    CHECK(d->AllocateDescriptorSets(dv, &dsai, &sc->set));
-    VkDescriptorImageInfo dii{sc->sampler, sc->history_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstSet = sc->set;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = &dii;
-    d->UpdateDescriptorSets(dv, 1, &w, 0, nullptr);
+    dsai.descriptorSetCount = 2;
+    dsai.pSetLayouts = layouts;
+    CHECK(d->AllocateDescriptorSets(dv, &dsai, sc->sets));
+    for (int c = 0; c < 2; c++) {
+        const VkImageView views[kBindings] = {sc->history[c].view, sc->luma[c].view, sc->luma[1 - c].view,
+                                              sc->luma[c].view, sc->motion_raw.view, sc->motion.view,
+                                              sc->motion.view, sc->luma2[c].view, sc->luma2[1 - c].view,
+                                              sc->luma2[c].view};
+        VkDescriptorImageInfo info[kBindings];
+        VkWriteDescriptorSet w[kBindings];
+        for (uint32_t i = 0; i < kBindings; i++) {
+            VkSampler sampler = types[i] != sampled ? VK_NULL_HANDLE : (i == 1 || i == 2 || i == 7 || i == 8)
+                                                                                           ? sc->sampler_nearest
+                                                                                           : sc->sampler;
+            info[i] = {sampler, views[i], VK_IMAGE_LAYOUT_GENERAL};
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstSet = sc->sets[c];
+            w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = types[i];
+            w[i].pImageInfo = &info[i];
+        }
+        d->UpdateDescriptorSets(dv, kBindings, w, 0, nullptr);
+    }
 
-    VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &sc->set_layout;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
     CHECK(d->CreatePipelineLayout(dv, &plci, nullptr, &sc->layout));
+
+    if (!create_compute(sc, luma_comp, sizeof luma_comp, &sc->luma_pipeline) ||
+        !create_compute(sc, pyramid_comp, sizeof pyramid_comp, &sc->pyramid_pipeline) ||
+        !create_compute(sc, motion_comp, sizeof motion_comp, &sc->motion_pipeline) ||
+        !create_compute(sc, filter_comp, sizeof filter_comp, &sc->filter_pipeline))
+        return false;
 
     VkAttachmentDescription att{};
     att.format = sc->format;
@@ -570,14 +696,10 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     rpci.pDependencies = &dep;
     CHECK(d->CreateRenderPass(dv, &rpci, nullptr, &sc->pass));
 
-    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     VkShaderModule vs, fs;
-    smci.codeSize = sizeof fullscreen_vert;
-    smci.pCode = fullscreen_vert;
-    CHECK(d->CreateShaderModule(dv, &smci, nullptr, &vs));
-    smci.codeSize = sizeof probe_frag;
-    smci.pCode = probe_frag;
-    CHECK(d->CreateShaderModule(dv, &smci, nullptr, &fs));
+    if (!create_shader(d, fullscreen_vert, sizeof fullscreen_vert, &vs) ||
+        !create_shader(d, warp_frag, sizeof warp_frag, &fs))
+        return false;
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr},
@@ -623,6 +745,10 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     sc->views.assign(sc->images.size(), VK_NULL_HANDLE);
     sc->framebuffers.assign(sc->images.size(), VK_NULL_HANDLE);
     for (size_t i = 0; i < sc->images.size(); i++) {
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = sc->format;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vci.image = sc->images[i];
         CHECK(d->CreateImageView(dv, &vci, nullptr, &sc->views[i]));
         VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -644,7 +770,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cbai.commandPool = sc->cmd_pool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = kMaxMultiplier;
+        cbai.commandBufferCount = kMaxMultiplier + 1;
         CHECK(d->AllocateCommandBuffers(dv, &cbai, s.cmd));
         for (auto c : s.cmd) {
             // Command buffers made by a layer need the loader's dispatch table.
@@ -665,7 +791,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         if (sc->timestamps) {
             VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qci.queryCount = 2 * kMaxMultiplier;
+            qci.queryCount = 2 * (kMaxMultiplier + 1);
             CHECK(d->CreateQueryPool(dv, &qci, nullptr, &s.queries));
         }
     }
@@ -757,13 +883,16 @@ void collect_timestamps(SwapchainData *sc, Slot &s)
     if (!sc->timestamps || !s.used)
         return;
     DeviceData *d = sc->dev;
-    uint64_t v[2 * kMaxMultiplier][2];
-    int n = 2 * (1 + s.generated);
-    VkResult r = d->GetQueryPoolResults(d->device, s.queries, 0, n, sizeof v, v, sizeof v[0],
+    uint64_t v[2 * (kMaxMultiplier + 1)][2] = {};
+    VkResult r = d->GetQueryPoolResults(d->device, s.queries, 0, 2 * (kMaxMultiplier + 1), sizeof v, v, sizeof v[0],
                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
     if (r != VK_SUCCESS && r != VK_NOT_READY)
         return;
     double scale = d->timestamp_period * 1e-6;
+    if (v[2 * kAnalysis][1] && v[2 * kAnalysis + 1][1]) {
+        sc->stats.motion_ms += (double)(v[2 * kAnalysis + 1][0] - v[2 * kAnalysis][0]) * scale;
+        sc->stats.motion_n++;
+    }
     for (int k = 0; k <= s.generated; k++) {
         if (!v[2 * k][1] || !v[2 * k + 1][1])
             continue;
@@ -785,15 +914,71 @@ void report(SwapchainData *sc, double t)
     double dt = t - st.window_start;
     if (dt < g_cfg.log_every)
         return;
-    logf("real %.1f fps (worst gap %.1f ms), shown %.1f fps, missed %d | GPU copy %.2f ms, "
+    logf("real %.1f fps (worst gap %.1f ms), shown %.1f fps, missed %d | GPU copy %.2f ms, motion %.2f ms, "
          "generated frame %.2f ms (max %.2f) | CPU in extra presents %.2f ms (max %.2f)",
          st.real / dt, st.interval_max * 1e3, st.shown / dt, st.missed,
-         st.copy_n ? st.copy_ms / st.copy_n : 0.0, st.gen_n ? st.gen_ms / st.gen_n : 0.0,
+         st.copy_n ? st.copy_ms / st.copy_n : 0.0, st.motion_n ? st.motion_ms / st.motion_n : 0.0,
+         st.gen_n ? st.gen_ms / st.gen_n : 0.0,
          st.gen_ms_max, st.real ? st.extra_cpu_ms / st.real : 0.0, st.extra_cpu_ms_max);
     double last = st.last_real;
     st = Stats{};
     st.window_start = t;
     st.last_real = last;
+}
+
+PushConstants push_constants(SwapchainData *sc, float phase)
+{
+    return PushConstants{{1.0f, 0.0f, 1.0f, g_cfg.tint}, phase, g_cfg.mode, sc->has_prev ? 1 : 0, g_cfg.zero_bias};
+}
+
+void memory_barrier(DeviceData *d, VkCommandBuffer cmd, VkPipelineStageFlags src, VkAccessFlags src_access,
+                    VkPipelineStageFlags dst, VkAccessFlags dst_access)
+{
+    VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    b.srcAccessMask = src_access;
+    b.dstAccessMask = dst_access;
+    d->CmdPipelineBarrier(cmd, src, dst, 0, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+// Luma pyramid of the new real frame, motion against the previous one,
+// median filter. Runs right after the real frame is presented.
+VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
+{
+    DeviceData *d = sc->dev;
+    VkCommandBuffer cmd = s.cmd[kAnalysis];
+    d->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    d->BeginCommandBuffer(cmd, &bi);
+    if (sc->timestamps)
+        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.queries, 2 * kAnalysis);
+    d->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->layout, 0, 1, &sc->sets[sc->cur], 0, nullptr);
+    PushConstants pc = push_constants(sc, 0.0f);
+    d->CmdPushConstants(cmd, sc->layout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc,
+                        &pc);
+    const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    const VkAccessFlags rw = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->luma_pipeline);
+    d->CmdDispatch(cmd, (sc->luma_extent.width + 7) / 8, (sc->luma_extent.height + 7) / 8, 1);
+    memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
+    d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->pyramid_pipeline);
+    d->CmdDispatch(cmd, (sc->luma2_extent.width + 7) / 8, (sc->luma2_extent.height + 7) / 8, 1);
+    memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
+    d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->motion_pipeline);
+    d->CmdDispatch(cmd, sc->motion_extent.width, sc->motion_extent.height, 1);
+    memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
+    d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->filter_pipeline);
+    d->CmdDispatch(cmd, (sc->motion_extent.width + 7) / 8, (sc->motion_extent.height + 7) / 8, 1);
+    memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
+
+    if (sc->timestamps)
+        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.queries, 2 * kAnalysis + 1);
+    d->EndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    return d->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
 }
 
 VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, uint32_t image,
@@ -818,14 +1003,11 @@ VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, uin
     d->CmdSetViewport(cmd, 0, 1, &vp);
     d->CmdSetScissor(cmd, 0, 1, &sci);
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->pipeline);
-    d->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->layout, 0, 1, &sc->set, 0, nullptr);
-    struct {
-        float tint[4];
-        float shift[2];
-        int32_t taps;
-        int32_t pad;
-    } pc = {{1.0f, 0.0f, 1.0f, g_cfg.tint}, {g_cfg.shift * k, 0.0f}, g_cfg.taps, 0};
-    d->CmdPushConstants(cmd, sc->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    d->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->layout, 0, 1, &sc->sets[sc->cur], 0,
+                             nullptr);
+    PushConstants pc = push_constants(sc, (float)k / (float)g_cfg.multiplier);
+    d->CmdPushConstants(cmd, sc->layout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc,
+                        &pc);
     d->CmdDraw(cmd, 3, 1, 0, 0);
     d->CmdEndRenderPass(cmd);
 
@@ -900,26 +1082,38 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     d->BeginCommandBuffer(cmd, &bi);
     if (sc->timestamps) {
-        d->CmdResetQueryPool(cmd, s.queries, 0, 2 * kMaxMultiplier);
+        d->CmdResetQueryPool(cmd, s.queries, 0, 2 * (kMaxMultiplier + 1));
         d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.queries, 0);
     }
+    const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (!sc->initialized) {
+        for (Image *img : {&sc->history[0], &sc->history[1], &sc->luma[0], &sc->luma[1], &sc->luma2[0], &sc->luma2[1],
+                        &sc->motion_raw, &sc->motion})
+            image_barrier(d, cmd, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, shaders | VK_PIPELINE_STAGE_TRANSFER_BIT);
+        sc->initialized = true;
+        sc->has_prev = false;
+    }
+    // The new real frame goes into the other history slot; the frames drawn
+    // from it two presents ago must be done reading it.
+    sc->cur = 1 - sc->cur;
+    Image &history = sc->history[sc->cur];
     image_barrier(d, cmd, sc->images[image], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   0, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    image_barrier(d, cmd, sc->history, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                  VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+    memory_barrier(d, cmd, shaders, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | shaders,
+                   VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     VkImageCopy region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
     region.extent = {sc->extent.width, sc->extent.height, 1};
-    d->CmdCopyImage(cmd, sc->images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->history,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    d->CmdCopyImage(cmd, sc->images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, history.image,
+                    VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     image_barrier(d, cmd, sc->images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                   VK_ACCESS_TRANSFER_READ_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    image_barrier(d, cmd, sc->history, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    memory_barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, shaders,
+                   VK_ACCESS_SHADER_READ_BIT);
     if (sc->timestamps)
         d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.queries, 1);
     d->EndCommandBuffer(cmd);
@@ -946,8 +1140,11 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     VkResult result = d->QueuePresentKHR(queue, &real);
     st.shown += result >= 0;
 
-    // 3. Draw and present the generated frames.
+    // 3. Estimate the motion, then draw and present the generated frames.
     double t1 = now_s();
+    if (result >= 0 && g_cfg.mode != 0 && submit_analysis(sc, queue, s) != VK_SUCCESS)
+        result = VK_ERROR_DEVICE_LOST;
+    sc->has_prev = result >= 0;
     if (result >= 0) {
         for (int k = 1; k < g_cfg.multiplier; k++) {
             uint32_t idx;

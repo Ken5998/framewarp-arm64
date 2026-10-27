@@ -1,8 +1,9 @@
 name: CI
 
 # Builds the layer on an aarch64 runner in Fedora 44, the base of ArmadaOS,
-# runs vkcube through it on Mesa's software Vulkan driver with the validation
-# layer below it, and keeps the package as an artifact.
+# tests the motion shaders and runs vkcube through the layer on Mesa's
+# software Vulkan driver with the validation layer below it, and keeps the
+# package as an artifact.
 
 on:
   push:
@@ -23,6 +24,8 @@ jobs:
         run: bash -n scripts/*.sh
       - name: Build
         run: scripts/build.sh out
+      - name: Test the motion shaders
+        run: build/motion_test
       - name: Run vkcube through the layer
         run: |
           tar -xzf out/framewarp-*.tar.gz -C /tmp
@@ -37,12 +40,15 @@ jobs:
           export DISPLAY=:99 VK_LAYER_PATH=/tmp/explicit:/usr/share/vulkan/explicit_layer.d
           export VK_INSTANCE_LAYERS=VK_LAYER_FRAMEWARP_ci:VK_LAYER_KHRONOS_validation
           export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true
-          for mult in 2 3 4; do
-            FRAMEWARP_MULT=$mult FRAMEWARP_TAPS=9 FRAMEWARP_LOG=/tmp/fw-$mult.log FRAMEWARP_LOG_EVERY=1 \
-              timeout 20 vkcube --c 300 > /tmp/vkcube-$mult.txt 2>&1
-            cat /tmp/vkcube-$mult.txt
-            if grep -q -i -E "validation (error|warning)|VUID" /tmp/vkcube-$mult.txt; then exit 1; fi
-            grep -q "^real" /tmp/fw-$mult.log
+          for mode in warp debug copy; do
+            for mult in 2 3 4; do
+              run=$mode-$mult
+              FRAMEWARP_MODE=$mode FRAMEWARP_MULT=$mult FRAMEWARP_LOG=/tmp/fw-$run.log FRAMEWARP_LOG_EVERY=1 \
+                timeout 20 vkcube --c 300 > /tmp/vkcube-$run.txt 2>&1
+              cat /tmp/vkcube-$run.txt
+              if grep -q -i -E "validation (error|warning)|VUID" /tmp/vkcube-$run.txt; then exit 1; fi
+              grep -q "^real" /tmp/fw-$run.log
+            done
           done
       - uses: actions/upload-artifact@v4
         with:

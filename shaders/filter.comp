@@ -1,0 +1,39 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// 3x3 median of the motion field, per component: drops single wrong
+// matches without blurring motion edges much.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+float median9(float v[9])
+{
+    for (int i = 0; i < 5; i++)
+        for (int j = i + 1; j < 9; j++)
+            if (v[j] < v[i]) {
+                float s = v[i];
+                v[i] = v[j];
+                v[j] = s;
+            }
+    return v[4];
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(motion_raw);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    float xs[9], ys[9];
+    int n = 0;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            vec2 m = imageLoad(motion_raw, clamp(p + ivec2(x, y), ivec2(0), size - 1)).xy;
+            xs[n] = m.x;
+            ys[n] = m.y;
+            n++;
+        }
+    vec4 c = imageLoad(motion_raw, p);
+    imageStore(motion_out, p, vec4(median9(xs), median9(ys), c.z, 0.0));
+}
