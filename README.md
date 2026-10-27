@@ -61,12 +61,13 @@ Where the motion per block goes wrong, when the camera turns, on tyre smoke,
 or near cars that overtake, the generated frames show it as blocks.
 `FRAMEWARP_MODE=camera` trades that for one smooth motion of the whole
 picture, like the reprojection of VR headsets: after the block search it
-fits a single pan, zoom and roll to all the blocks, letting the blocks that
-disagree with it (the player's car, the HUD, smoke, other cars) count less
-and less over a few rounds, and keeps whichever of two starting points more
-blocks agree with. Then every 4x4 pixels chooses between that motion and no
-motion at all, so the player's car and the HUD stay where they are while the
-road and the scenery move with the camera. There are no blocks, but anything
+fits a single smooth motion to the blocks that move: pan, zoom and roll, and
+perspective, since when driving forward the road close to the camera moves
+much faster than the horizon. Blocks that disagree with it (smoke, other
+cars) count less and less over a few rounds, and of two starting points it
+keeps the one more blocks agree with. Then every 4x4 pixels chooses between
+that motion and no motion at all, so the player's car and the HUD stay where
+they are while the road and the scenery move with the camera. There are no blocks, but anything
 that moves on its own, such as another car, moves with the camera in the
 generated frames and catches up at the next real frame.
 
@@ -117,7 +118,7 @@ camera mode a second line shows the camera it found, on average per real
 frame:
 
 ```
-  camera per real frame: pan 4.2 px (max 6.2), zoom +0.11%, roll +1.46 deg | blocks that move 67%, that agree with the camera 52%
+  camera per real frame: pan 4.2 px (max 6.2), zoom +0.11%, roll +1.46 deg | blocks that move 67%, of those that agree with the camera 77%
 ```
 
 ## Build
@@ -130,8 +131,8 @@ It needs CMake, a C++17 compiler, the Vulkan headers and loader, and
 `glslangValidator`. `build/motion_test` runs the motion shaders on a pattern
 moved by known amounts, everywhere or in one half only, and checks the motion
 they find per block and per pixel; it also zooms the pattern and keeps a still
-strip at the bottom, like a HUD, and checks the camera motion and which pixels
-camera mode keeps still. CI builds the aarch64
+strip at the bottom, like a HUD, or adds perspective, and checks the camera
+motion and which pixels camera mode keeps still. CI builds the aarch64
 package in Fedora 44, the base of ArmadaOS, runs that test and runs vkcube
 through the layer with the validation layer below it, on Mesa's software
 driver.

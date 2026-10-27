@@ -15,7 +15,7 @@ layout(set = 0, binding = 10) uniform sampler2D frame_prev; // the real frame be
 layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D pixel_motion_out;
 layout(set = 0, binding = 12) uniform sampler2D pixel_motion; // per luma pixel
 layout(set = 0, binding = 13, rgba32f) uniform writeonly image2D camera_out;
-layout(set = 0, binding = 14) uniform sampler2D camera;   // 2x1: the global motion model
+layout(set = 0, binding = 14) uniform sampler2D camera;   // 4x1: the global motion model
 
 layout(push_constant) uniform Params {
     vec4 tint;      // rgb, a = strength (0 = off)
@@ -34,14 +34,20 @@ bool camera_mode()
     return pc.mode >= 3;
 }
 
-// The camera model: motion(p) = A p + b in frame pixels per real frame, p in
-// frame heights from the centre. camera texel 0 = (a11, a12, b.x, share of
-// the blocks that agree with it), texel 1 = (a21, a22, b.y, share of the
-// blocks that move at all); the shares are only for the log.
+// The camera model, in frame pixels per real frame, with p in frame heights
+// from the centre: motion.x = cx . (1, x, y, x^2, xy, y^2), likewise y.
+// camera texels: 0 = cx[0..3], 1 = (cx[4], cx[5], share of the moving blocks
+// that agree with it, share of the blocks that move), 2 = cy[0..3],
+// 3 = (cy[4], cy[5]); the shares are only for the log.
 vec2 camera_motion(vec2 frag, vec2 size)
 {
     vec2 p = (frag - 0.5 * size) / size.y;
-    vec4 r0 = texelFetch(camera, ivec2(0, 0), 0);
-    vec4 r1 = texelFetch(camera, ivec2(1, 0), 0);
-    return vec2(dot(r0.xyz, vec3(p, 1.0)), dot(r1.xyz, vec3(p, 1.0)));
+    vec4 f0 = vec4(1.0, p.x, p.y, p.x * p.x);
+    vec2 f1 = vec2(p.x * p.y, p.y * p.y);
+    vec4 x0 = texelFetch(camera, ivec2(0, 0), 0), x1 = texelFetch(camera, ivec2(1, 0), 0);
+    vec4 y0 = texelFetch(camera, ivec2(2, 0), 0), y1 = texelFetch(camera, ivec2(3, 0), 0);
+    vec2 m = vec2(dot(x0, f0) + dot(x1.xy, f1), dot(y0, f0) + dot(y1.xy, f1));
+    // Far from the blocks it was fitted to a quadratic can run away; no
+    // more than the block search could have found.
+    return m * min(1.0, 160.0 / max(length(m), 1e-6));
 }

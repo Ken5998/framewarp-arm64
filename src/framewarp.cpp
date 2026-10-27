@@ -354,7 +354,7 @@ struct SwapchainData {
     Image motion_raw;    // block motion, one texel per 32x32 frame pixels
     Image motion;        // the same after the median filter
     Image pixel_motion;  // per luma pixel, picked among the block vectors
-    Image camera;        // one affine motion for the whole frame, 2x1
+    Image camera;        // one smooth motion for the whole frame, 4x1
     VkExtent2D luma_extent{}, luma2_extent{}, motion_extent{};
     bool initialized = false;
     int cur = 0;         // history slot of the last real frame
@@ -677,7 +677,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     if (!create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion_raw) ||
         !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion) ||
         !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->luma_extent, storage, sc->pixel_motion) ||
-        !create_image(d, VK_FORMAT_R32G32B32A32_SFLOAT, {2, 1}, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, sc->camera))
+        !create_image(d, VK_FORMAT_R32G32B32A32_SFLOAT, {4, 1}, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, sc->camera))
         return false;
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -882,7 +882,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         }
         if (g_cfg.mode >= 3) {
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bci.size = 2 * 4 * sizeof(float);
+            bci.size = 4 * 4 * sizeof(float);
             bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             CHECK(d->CreateBuffer(dv, &bci, nullptr, &s.camera));
             VkMemoryRequirements req;
@@ -1019,15 +1019,18 @@ void collect_camera(SwapchainData *sc, Slot &s)
     if (!s.camera_valid)
         return;
     s.camera_valid = false;
-    const float *v = s.camera_data; // a11 a12 bx agree, a21 a22 by moving
+    // cx[0..5] agree moving, cy[0..5] (see shaders/common.glsl); the
+    // constant and linear terms give pan, zoom and roll at the centre.
+    const float *v = s.camera_data;
+    const float *cx = v, *cy = v + 8;
     double h = sc->extent.height;
     Stats &st = sc->stats;
-    double pan = std::hypot(v[2], v[6]);
+    double pan = std::hypot(cx[0], cy[0]);
     st.pan += pan;
     st.pan_max = std::max(st.pan_max, pan);
-    st.zoom += (v[0] + v[5]) * 0.5 / h * 100.0;
-    st.roll += (v[4] - v[1]) * 0.5 / h * 57.29578;
-    st.agree += v[3];
+    st.zoom += (cx[1] + cy[2]) * 0.5 / h * 100.0;
+    st.roll += (cy[1] - cx[2]) * 0.5 / h * 57.29578;
+    st.agree += v[6];
     st.moving += v[7];
     st.camera_n++;
 }
@@ -1048,7 +1051,7 @@ void report(SwapchainData *sc, double t)
     if (st.camera_n) {
         double n = st.camera_n;
         logf("  camera per real frame: pan %.1f px (max %.1f), zoom %+.2f%%, roll %+.2f deg | blocks that move "
-             "%.0f%%, that agree with the camera %.0f%%",
+             "%.0f%%, of those that agree with the camera %.0f%%",
              st.pan / n, st.pan_max, st.zoom / n, st.roll / n, st.moving / n * 100.0, st.agree / n * 100.0);
     }
     double last = st.last_real;
@@ -1110,7 +1113,7 @@ VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
         if (sc->has_prev && s.camera) {
             VkBufferImageCopy region{};
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.imageExtent = {2, 1, 1};
+            region.imageExtent = {4, 1, 1};
             d->CmdCopyImageToBuffer(cmd, sc->camera.image, VK_IMAGE_LAYOUT_GENERAL, s.camera, 1, &region);
             memory_barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                            VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);

@@ -217,11 +217,11 @@ int main()
     Image motion_raw = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kMotion, storage);
     Image motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kMotion, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     Image pixel_motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, kLuma, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    Image camera = make_image(VK_FORMAT_R32G32B32A32_SFLOAT, 1, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 2);
+    Image camera = make_image(VK_FORMAT_R32G32B32A32_SFLOAT, 1, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 4);
     Buffer upload = make_buffer(kSize * kSize * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     Buffer readback = make_buffer(kMotion * kMotion * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer readback_px = make_buffer(kLuma * kLuma * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    Buffer readback_cam = make_buffer(2 * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer readback_cam = make_buffer(4 * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
@@ -304,19 +304,22 @@ int main()
     // frames, everywhere or (split) only in the left half while the right
     // half stays still. The blocks should find that motion to the 4 pixel
     // grid, and the per pixel motion should follow the split. Some cases
-    // also zoom the pattern about the centre, or keep a still strip at the
-    // bottom like a HUD; those only check the camera model, which should
-    // give the motion of the pattern everywhere.
+    // also zoom the pattern about the centre, add perspective (the bottom
+    // moving faster and spreading out, like the road when driving forward),
+    // or keep a still strip at the bottom like a HUD; those only check the
+    // camera model, which should give the motion of the pattern everywhere.
     struct Case {
         int dx, dy;
         bool split;
         float zoom = 1.0f;
         bool hud = false;
+        float perspective = 0.0f;
     };
     const Case cases[] = {{0, 0, false},      {12, -8, false},       {-20, 4, false},       {30, 18, false},
                           {-60, -40, false},  {100, -60, false},     {24, 8, true},         {-36, 0, true},
                           {0, 0, false, 1.05f}, {8, -4, false, 0.96f}, {12, 6, false, 1.0f, true},
-                          {-6, 10, false, 1.03f, true}};
+                          {-6, 10, false, 1.03f, true}, {0, 4, false, 1.0f, false, 0.12f},
+                          {4, 6, false, 1.02f, true, 0.1f}};
     int failures = 0;
     for (const Case &c : cases) {
         float dx = (float)c.dx, dy = (float)c.dy;
@@ -324,10 +327,11 @@ int main()
         const float half = kSize / 2.0f;
         // Where the pattern at frame 1 pixel (x, y) was in frame 0.
         auto source = [&](float x, float y, float &sx, float &sy) {
-            sx = half + (x - half) / c.zoom - dx;
-            sy = half + (y - half) / c.zoom - dy;
+            float k = c.perspective * (y - half) / kSize;
+            sx = half + (x - half) / c.zoom - dx - k * (x - half);
+            sy = half + (y - half) / c.zoom - dy - k * (y - half);
         };
-        const bool camera_only = c.zoom != 1.0f || c.hud;
+        const bool camera_only = c.zoom != 1.0f || c.hud || c.perspective != 0.0f;
         pc.mode = camera_only ? 3 : 1;
         for (int f = 0; f < 2; f++) {
             auto *px = (uint8_t *)upload.data;
@@ -376,32 +380,37 @@ int main()
                 vkCmdCopyImageToBuffer(cmd, motion.image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &rb);
                 rb.imageExtent = {kLuma, kLuma, 1};
                 vkCmdCopyImageToBuffer(cmd, pixel_motion.image, VK_IMAGE_LAYOUT_GENERAL, readback_px.buffer, 1, &rb);
-                rb.imageExtent = {2, 1, 1};
+                rb.imageExtent = {4, 1, 1};
                 vkCmdCopyImageToBuffer(cmd, camera.image, VK_IMAGE_LAYOUT_GENERAL, readback_cam.buffer, 1, &rb);
             }
             end(cmd);
         }
 
         // The camera model against the true motion of the pattern, inside
-        // the frame and away from the still strip (split cases have no single
-        // motion).
+        // the frame and above the still strip, where camera mode keeps the
+        // picture still anyway (split cases have no single motion).
         bool camera_ok = true;
         if (!c.split) {
-            auto *rows = (float *)readback_cam.data;
+            auto *v = (float *)readback_cam.data; // cx[0..3], cx[4..5], .., cy[0..3], cy[4..5]
             float worst = 0;
-            for (float y = 64; y <= kSize - 64; y += 32)
+            const float bottom = c.hud ? kSize * 3 / 4 - 32 : kSize - 64;
+            for (float y = 64; y <= bottom; y += 32)
                 for (float x = 64; x <= kSize - 64; x += 32) {
                     float qx = (x - half) / kSize, qy = (y - half) / kSize;
-                    float mx = rows[0] * qx + rows[1] * qy + rows[2];
-                    float my = rows[4] * qx + rows[5] * qy + rows[6];
+                    const float f[6] = {1, qx, qy, qx * qx, qx * qy, qy * qy};
+                    float mx = 0, my = 0;
+                    for (int i = 0; i < 6; i++) {
+                        mx += v[i] * f[i];
+                        my += v[8 + i] * f[i];
+                    }
                     // The pattern point now at (x, y) moved there from source.
                     float sx, sy;
                     source(x, y, sx, sy);
                     worst = fmaxf(worst, hypotf(mx - (x - sx), my - (y - sy)));
                 }
             camera_ok = worst <= 3.0f; // block vectors are on a 4 px grid
-            printf("move (%+.0f, %+.0f) zoom %.2f%s: camera model off by %.2f px at most %s\n", dx, dy, c.zoom,
-                   c.hud ? " with a still strip" : "", worst, camera_ok ? "ok" : "FAIL");
+            printf("move (%+.0f, %+.0f) zoom %.2f perspective %.2f%s: camera model off by %.2f px at most %s\n", dx,
+                   dy, c.zoom, c.perspective, c.hud ? " with a still strip" : "", worst, camera_ok ? "ok" : "FAIL");
             failures += !camera_ok;
         }
         if (camera_only) {
@@ -419,8 +428,8 @@ int main()
                     good += (half_to_float(pm[4 * (y * kLuma + x) + 3]) == 0.0f) == still;
                 }
             bool split_ok = good >= total * 95 / 100;
-            printf("move (%+.0f, %+.0f) zoom %.2f%s: %d/%d pixels rightly still or moving %s\n", dx, dy, c.zoom,
-                   c.hud ? " with a still strip" : "", good, total, split_ok ? "ok" : "FAIL");
+            printf("move (%+.0f, %+.0f) zoom %.2f perspective %.2f%s: %d/%d pixels rightly still or moving %s\n", dx,
+                   dy, c.zoom, c.perspective, c.hud ? " with a still strip" : "", good, total, split_ok ? "ok" : "FAIL");
             failures += !split_ok;
             continue;
         }

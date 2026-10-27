@@ -2,34 +2,37 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-// Camera mode: one motion for the whole frame. Fits motion(p) = A p + b
-// (pan, zoom, roll and shear) to the block vectors by weighted least
-// squares, then reweights the blocks by how well they fit, a few rounds, so
-// the player's car, the HUD and smoke, which don't move with the camera,
-// stop pulling the fit. Two starts, and the fit that more blocks agree with
-// wins:
-// - all blocks, with the reweighting tightening round by round;
-// - the most common moving block vector, as a pan first, which holds when
-//   a large still part (car, HUD) would bend the first one.
+// Camera mode: one smooth motion for the whole frame, quadratic in the
+// position (pan, zoom, roll, and perspective: when driving forward the road
+// close to the camera moves much faster than the horizon). Fitted by
+// weighted least squares to the blocks that move; the still ones (the
+// player's car, the HUD, the sky) are left to refine.comp, which keeps them
+// still per pixel. Then the blocks are reweighted by how well they fit, a few
+// rounds, so other cars and smoke stop pulling the fit. Two starts, and the
+// fit that more blocks agree with wins:
+// - all moving blocks, with the reweighting tightening round by round;
+// - the most common block vector, as a pan first.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 64) in;
 
-const int kThreads = 256;
+const int kThreads = 64;
+const int kTerms = 6;         // 1, x, y, x^2, xy, y^2
+const int kSums = 33;         // 21 for the symmetric matrix, 6 + 6 right-hand sides
 const int kRounds = 6;        // per start
 const int kPanRounds = 2;     // second start: rounds that fit a pan only
 const float kSigma = 4.0;     // frame pixels, final width of "agrees with the fit"
 const int kBins = 65;         // block vectors are multiples of 4 in -128..128
+const float kMinMoving = 0.05; // less than this share of blocks moving: no camera motion
 
-shared float sums[kThreads][12];
-shared vec3 row0, row1;
-shared vec3 best0, best1;
+shared float sums[kThreads][kSums];
+shared float cx[kTerms], cy[kTerms];
+shared float best_x[kTerms], best_y[kTerms];
 shared float best_support;
 shared uint hist[2][kBins];
-shared uint total_weight, moving_weight; // for the log
+shared uint total_weight, moving_weight;
 
 // How much a block's vector can be trusted: blocks that matched badly, or
-// that match anything (flat sky and road, which say "no motion" whatever the
-// camera does), weigh less.
+// that match anything (flat areas), weigh less.
 float confidence(vec4 m)
 {
     return m.w * m.w / (m.w * m.w + 0.02 * 0.02) / (1.0 + m.z * m.z / (0.03 * 0.03));
@@ -40,6 +43,70 @@ int bin(float v)
     return clamp(int(round(v / 4.0)) + kBins / 2, 0, kBins - 1);
 }
 
+void basis(vec2 p, out float f[kTerms])
+{
+    f[0] = 1.0;
+    f[1] = p.x;
+    f[2] = p.y;
+    f[3] = p.x * p.x;
+    f[4] = p.x * p.y;
+    f[5] = p.y * p.y;
+}
+
+// Solves M c = b for the two right-hand sides by Gaussian elimination with
+// partial pivoting; M gets a small ridge so a frame with few moving blocks
+// falls back towards a pan instead of blowing up.
+void solve(float s[kSums])
+{
+    float a[kTerms][kTerms + 2];
+    int k = 0;
+    for (int i = 0; i < kTerms; i++)
+        for (int j = i; j < kTerms; j++) {
+            a[i][j] = s[k];
+            a[j][i] = s[k];
+            k++;
+        }
+    for (int i = 0; i < kTerms; i++) {
+        a[i][kTerms] = s[21 + i];
+        a[i][kTerms + 1] = s[27 + i];
+    }
+    for (int i = 1; i < kTerms; i++)
+        a[i][i] += 1e-4 * s[0];
+    for (int c = 0; c < kTerms; c++) {
+        int p = c;
+        for (int r = c + 1; r < kTerms; r++)
+            if (abs(a[r][c]) > abs(a[p][c]))
+                p = r;
+        for (int j = 0; j < kTerms + 2; j++) {
+            float tmp = a[c][j];
+            a[c][j] = a[p][j];
+            a[p][j] = tmp;
+        }
+        float d = a[c][c];
+        if (abs(d) < 1e-12) {
+            for (int i = 0; i < kTerms; i++) {
+                cx[i] = 0.0;
+                cy[i] = 0.0;
+            }
+            return;
+        }
+        for (int r = c + 1; r < kTerms; r++) {
+            float f = a[r][c] / d;
+            for (int j = c; j < kTerms + 2; j++)
+                a[r][j] -= f * a[c][j];
+        }
+    }
+    for (int i = kTerms - 1; i >= 0; i--) {
+        float x = a[i][kTerms], y = a[i][kTerms + 1];
+        for (int j = i + 1; j < kTerms; j++) {
+            x -= a[i][j] * cx[j];
+            y -= a[i][j] * cy[j];
+        }
+        cx[i] = x / a[i][i];
+        cy[i] = y / a[i][i];
+    }
+}
+
 void main()
 {
     uint t = gl_LocalInvocationIndex;
@@ -48,9 +115,9 @@ void main()
     int n = blocks.x * blocks.y;
 
     // The most common x and y among the block vectors that move.
-    if (t < kBins) {
-        hist[0][t] = 0u;
-        hist[1][t] = 0u;
+    for (uint k = t; k < kBins; k += kThreads) {
+        hist[0][k] = 0u;
+        hist[1][k] = 0u;
     }
     if (t == 0) {
         best_support = -1.0;
@@ -71,31 +138,41 @@ void main()
         atomicAdd(hist[1][bin(m.y)], w);
     }
     barrier();
+    float total = max(float(total_weight), 1.0);
+    float moving_share = float(moving_weight) / total;
 
     for (int start = 0; start < 2; start++) {
-        if (t < 2) {
-            vec3 r = vec3(0.0);
-            if (start == 1) {
-                int best = kBins / 2;
-                for (int k = 0; k < kBins; k++)
-                    if (hist[t][k] > hist[t][best])
-                        best = k;
-                r.z = float((best - kBins / 2) * 4);
+        if (t == 0) {
+            for (int i = 0; i < kTerms; i++) {
+                cx[i] = 0.0;
+                cy[i] = 0.0;
             }
-            if (t == 0)
-                row0 = r;
-            else
-                row1 = r;
+            if (start == 1) {
+                int bx = kBins / 2, by = kBins / 2;
+                for (int k = 0; k < kBins; k++) {
+                    if (hist[0][k] > hist[0][bx])
+                        bx = k;
+                    if (hist[1][k] > hist[1][by])
+                        by = k;
+                }
+                cx[0] = float((bx - kBins / 2) * 4);
+                cy[0] = float((by - kBins / 2) * 4);
+            }
         }
         barrier();
 
         for (int it = 0; it < kRounds; it++) {
-            // First start: plain least squares, then a width that halves
+            // First start: plain least squares, then a width that quarters
             // down to kSigma. Second start: kSigma from the first round.
             float sigma = start == 0 ? max(kSigma, 64.0 / float(1 << (2 * it))) : kSigma;
             bool weigh = start == 1 || it > 0;
-            float acc[12];
-            for (int k = 0; k < 12; k++)
+            float mx[kTerms], my[kTerms];
+            for (int i = 0; i < kTerms; i++) {
+                mx[i] = cx[i];
+                my[i] = cy[i];
+            }
+            float acc[kSums];
+            for (int k = 0; k < kSums; k++)
                 acc[k] = 0.0;
             for (int i = int(t); i < n; i += kThreads) {
                 ivec2 b = ivec2(i % blocks.x, i / blocks.x);
@@ -103,76 +180,83 @@ void main()
                 if (any(greaterThanEqual(centre, size)))
                     continue;
                 vec4 m = texelFetch(motion, b, 0);
-                vec3 q = vec3((centre - 0.5 * size) / size.y, 1.0);
+                if (m.xy == vec2(0.0))
+                    continue;
+                float f[kTerms];
+                basis((centre - 0.5 * size) / size.y, f);
                 float w = confidence(m);
                 if (weigh) {
-                    vec2 r = m.xy - vec2(dot(row0, q), dot(row1, q));
+                    vec2 fit = vec2(0.0);
+                    for (int k = 0; k < kTerms; k++)
+                        fit += vec2(mx[k], my[k]) * f[k];
+                    vec2 r = m.xy - fit;
                     float g = 1.0 + dot(r, r) / (sigma * sigma);
                     w /= g * g;
                 }
-                // Normal equations: M = sum w q q^T (6 values), rhs for x and y.
-                acc[0] += w * q.x * q.x;
-                acc[1] += w * q.x * q.y;
-                acc[2] += w * q.x;
-                acc[3] += w * q.y * q.y;
-                acc[4] += w * q.y;
-                acc[5] += w;
-                acc[6] += w * m.x * q.x;
-                acc[7] += w * m.x * q.y;
-                acc[8] += w * m.x;
-                acc[9] += w * m.y * q.x;
-                acc[10] += w * m.y * q.y;
-                acc[11] += w * m.y;
+                int k = 0;
+                for (int a = 0; a < kTerms; a++)
+                    for (int c = a; c < kTerms; c++)
+                        acc[k++] += w * f[a] * f[c];
+                for (int a = 0; a < kTerms; a++) {
+                    acc[21 + a] += w * m.x * f[a];
+                    acc[27 + a] += w * m.y * f[a];
+                }
             }
-            for (int k = 0; k < 12; k++)
+            for (int k = 0; k < kSums; k++)
                 sums[t][k] = acc[k];
             barrier();
             for (uint stride = kThreads / 2; stride > 0; stride /= 2) {
                 if (t < stride)
-                    for (int k = 0; k < 12; k++)
+                    for (int k = 0; k < kSums; k++)
                         sums[t][k] += sums[t + stride][k];
                 barrier();
             }
             if (t == 0) {
-                float s[12];
-                for (int k = 0; k < 12; k++)
+                float s[kSums];
+                for (int k = 0; k < kSums; k++)
                     s[k] = sums[0][k];
-                bool last = it == kRounds - 1;
-                // The total weight of the last round is how many blocks agree
-                // with the fit of the round before.
-                if (last && s[5] > best_support) {
-                    best_support = s[5];
-                    best0 = row0;
-                    best1 = row1;
-                }
-                mat3 M = mat3(s[0], s[1], s[2], s[1], s[3], s[4], s[2], s[4], s[5]);
-                vec3 bx = vec3(s[6], s[7], s[8]);
-                vec3 by = vec3(s[9], s[10], s[11]);
-                if (last) {
-                } else if (s[5] <= 1e-6) {
-                    row0 = vec3(0.0);
-                    row1 = vec3(0.0);
-                } else if ((start == 0 || it >= kPanRounds) && abs(determinant(M)) > 1e-9 * s[5] * s[5] * s[5]) {
-                    mat3 inv = inverse(M);
-                    row0 = inv * bx;
-                    row1 = inv * by;
+                if (it == kRounds - 1) {
+                    // The total weight of the last round is how many blocks
+                    // agree with the fit of the round before.
+                    if (s[0] > best_support) {
+                        best_support = s[0];
+                        for (int i = 0; i < kTerms; i++) {
+                            best_x[i] = cx[i];
+                            best_y[i] = cy[i];
+                        }
+                    }
+                } else if (s[0] <= 1e-6) {
+                    for (int i = 0; i < kTerms; i++) {
+                        cx[i] = 0.0;
+                        cy[i] = 0.0;
+                    }
+                } else if (start == 1 && it < kPanRounds) {
+                    for (int i = 1; i < kTerms; i++) {
+                        cx[i] = 0.0;
+                        cy[i] = 0.0;
+                    }
+                    cx[0] = s[21] / s[0];
+                    cy[0] = s[27] / s[0];
                 } else {
-                    // A pan only: second start's first rounds, or too few
-                    // blocks to tell zoom from pan.
-                    row0 = vec3(0.0, 0.0, s[8] / s[5]);
-                    row1 = vec3(0.0, 0.0, s[11] / s[5]);
+                    solve(s);
                 }
             }
             barrier();
         }
     }
     if (t == 0) {
-        bool ok = pc.has_prev != 0 && all(lessThan(abs(vec4(best0, best1.x)), vec4(1e4))) &&
-                  abs(best1.y) < 1e4 && abs(best1.z) < 1e4;
-        float total = max(float(total_weight) / 1024.0, 1e-6);
-        float agree = clamp(best_support / total, 0.0, 1.0);
-        float moving = float(moving_weight) / 1024.0 / total;
-        imageStore(camera_out, ivec2(0, 0), ok ? vec4(best0, agree) : vec4(0.0));
-        imageStore(camera_out, ivec2(1, 0), ok ? vec4(best1, moving) : vec4(0.0));
+        bool ok = pc.has_prev != 0 && moving_share >= kMinMoving;
+        for (int i = 0; i < kTerms; i++)
+            ok = ok && abs(best_x[i]) < 1e4 && abs(best_y[i]) < 1e4;
+        float agree = clamp(best_support * 1024.0 / max(float(moving_weight), 1.0), 0.0, 1.0);
+        if (!ok)
+            for (int i = 0; i < kTerms; i++) {
+                best_x[i] = 0.0;
+                best_y[i] = 0.0;
+            }
+        imageStore(camera_out, ivec2(0, 0), vec4(best_x[0], best_x[1], best_x[2], best_x[3]));
+        imageStore(camera_out, ivec2(1, 0), vec4(best_x[4], best_x[5], agree, moving_share));
+        imageStore(camera_out, ivec2(2, 0), vec4(best_y[0], best_y[1], best_y[2], best_y[3]));
+        imageStore(camera_out, ivec2(3, 0), vec4(best_y[4], best_y[5], 0.0, 0.0));
     }
 }
