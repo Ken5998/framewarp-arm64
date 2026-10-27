@@ -34,7 +34,7 @@ void main()
         imageStore(pixel_motion_out, p, vec4(0.0));
         return;
     }
-    if (pc.mode == 3) {
+    if (camera_mode()) {
         vec2 cam = camera_motion((vec2(p) + 0.5) * float(kScale), vec2(textureSize(frame, 0)));
         float moving = cost(p, ivec2(round(cam / float(kScale))), size);
         bool still = cost(p, ivec2(0), size) < moving * (1.0 - pc.zero_bias);

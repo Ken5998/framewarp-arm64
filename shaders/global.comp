@@ -25,6 +25,7 @@ shared vec3 row0, row1;
 shared vec3 best0, best1;
 shared float best_support;
 shared uint hist[2][kBins];
+shared uint total_weight, moving_weight; // for the log
 
 // How much a block's vector can be trusted: blocks that matched badly, or
 // that match anything (flat sky and road, which say "no motion" whatever the
@@ -51,17 +52,21 @@ void main()
         hist[0][t] = 0u;
         hist[1][t] = 0u;
     }
-    if (t == 0)
+    if (t == 0) {
         best_support = -1.0;
+        total_weight = moving_weight = 0u;
+    }
     barrier();
     for (int i = int(t); i < n; i += kThreads) {
         ivec2 b = ivec2(i % blocks.x, i / blocks.x);
         if (any(greaterThanEqual((vec2(b) + 0.5) * float(kScale * kBlock), size)))
             continue;
         vec4 m = texelFetch(motion, b, 0);
+        uint w = uint(confidence(m) * 1024.0);
+        atomicAdd(total_weight, w);
         if (m.xy == vec2(0.0))
             continue;
-        uint w = uint(confidence(m) * 1024.0);
+        atomicAdd(moving_weight, w);
         atomicAdd(hist[0][bin(m.x)], w);
         atomicAdd(hist[1][bin(m.y)], w);
     }
@@ -164,7 +169,10 @@ void main()
     if (t == 0) {
         bool ok = pc.has_prev != 0 && all(lessThan(abs(vec4(best0, best1.x)), vec4(1e4))) &&
                   abs(best1.y) < 1e4 && abs(best1.z) < 1e4;
-        imageStore(camera_out, ivec2(0, 0), ok ? vec4(best0, 0.0) : vec4(0.0));
-        imageStore(camera_out, ivec2(1, 0), ok ? vec4(best1, 0.0) : vec4(0.0));
+        float total = max(float(total_weight) / 1024.0, 1e-6);
+        float agree = clamp(best_support / total, 0.0, 1.0);
+        float moving = float(moving_weight) / 1024.0 / total;
+        imageStore(camera_out, ivec2(0, 0), ok ? vec4(best0, agree) : vec4(0.0));
+        imageStore(camera_out, ivec2(1, 0), ok ? vec4(best1, moving) : vec4(0.0));
     }
 }

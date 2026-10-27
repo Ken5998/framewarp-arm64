@@ -28,7 +28,8 @@ void main()
     vec2 px = 1.0 / vec2(textureSize(frame, 0));
     vec3 here = texture(frame, uv).rgb;
     vec2 m = vec2(0.0);
-    if (pc.mode == 3 && pc.has_prev != 0) {
+    bool still = false;
+    if (camera_mode() && pc.has_prev != 0) {
         vec2 cam = camera_motion(gl_FragCoord.xy, 1.0 / px);
         ivec2 size = textureSize(pixel_motion, 0);
         ivec2 base = ivec2(floor(gl_FragCoord.xy / float(kScale) - 0.5));
@@ -45,6 +46,7 @@ void main()
             if (dc.r + dc.g + dc.b < dz.r + dz.g + dz.b)
                 m = cam;
         }
+        still = m == vec2(0.0);
     } else if (pc.mode != 0 && pc.has_prev != 0) {
         // The motion is known per 4x4 pixels; each pixel takes, of the 2x2
         // nearest of those, the vector that best explains its own colour in
@@ -68,7 +70,7 @@ void main()
         vec2 src = uv - pc.phase * m * px;
         // The camera warp moves the whole frame, so near the edges it takes
         // the edge pixel rather than leaving a seam.
-        bool inside = pc.mode == 3 ||
+        bool inside = camera_mode() ||
                       (all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0))));
         if (inside && !unchanged(src))
             c = texture(frame, src).rgb;
@@ -78,6 +80,14 @@ void main()
         float speed = clamp(length(m) / 64.0, 0.0, 1.0);
         vec3 dir = 0.5 + 0.5 * vec3(normalize(m + 1e-6), -normalize(m + 1e-6).x);
         c = mix(c, dir, speed * 0.7);
+    } else if (pc.mode == 4 && pc.phase > 0.0) {
+        // Camera overlay on the generated frames: blue = kept still (should
+        // be only the car and the HUD), yellow = the camera moves this pixel
+        // less than 2 pixels per real frame.
+        if (still)
+            c = mix(c, vec3(0.0, 0.3, 1.0), 0.5);
+        else if (dot(m, m) < 4.0)
+            c = mix(c, vec3(1.0, 0.9, 0.0), 0.5);
     }
     color = vec4(mix(c, pc.tint.rgb, pc.tint.a), 1.0);
 }

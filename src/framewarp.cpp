@@ -16,6 +16,7 @@
 #include <vulkan/vk_layer.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
@@ -51,7 +52,7 @@ struct Config {
     bool auto_mult = false;
     double refresh = 1.0 / 60.0;
     bool force_fifo = true;
-    int mode = 1; // 0 = copy, 1 = warp, 2 = warp + motion overlay, 3 = camera
+    int mode = 1; // 0 = copy, 1 = warp, 2 = warp + motion overlay, 3 = camera, 4 = camera + overlay
     float zero_bias = 0.05f;
     float tint = 0.0f;
     double log_every = 2.0;
@@ -87,7 +88,7 @@ void load_config()
         g_cfg.refresh = 1.0 / std::clamp(env_float("FRAMEWARP_REFRESH", 60.0f), 24.0f, 240.0f);
         g_cfg.force_fifo = env_int("FRAMEWARP_FORCE_FIFO", 1) != 0;
         if (const char *m = getenv("FRAMEWARP_MODE"); m && *m)
-            g_cfg.mode = !strcmp(m, "copy") ? 0 : !strcmp(m, "debug") ? 2 : !strcmp(m, "camera") ? 3 : 1;
+            g_cfg.mode = !strcmp(m, "copy") ? 0 : !strcmp(m, "debug") ? 2 : !strcmp(m, "camera") ? 3 : !strcmp(m, "camera-debug") ? 4 : 1;
         g_cfg.zero_bias = std::clamp(env_float("FRAMEWARP_ZERO_BIAS", 0.05f), 0.0f, 0.5f);
         g_cfg.tint = std::clamp(env_float("FRAMEWARP_TINT", 0.0f), 0.0f, 1.0f);
         g_cfg.log_every = std::max(0.5f, env_float("FRAMEWARP_LOG_EVERY", 2.0f));
@@ -169,6 +170,12 @@ template <typename T> void *key(T obj) { return *reinterpret_cast<void **>(obj);
     X(CreateImage)                                                             \
     X(DestroyImage)                                                            \
     X(GetImageMemoryRequirements)                                              \
+    X(CreateBuffer)                                                            \
+    X(DestroyBuffer)                                                           \
+    X(GetBufferMemoryRequirements)                                             \
+    X(BindBufferMemory)                                                        \
+    X(MapMemory)                                                               \
+    X(CmdCopyImageToBuffer)                                                    \
     X(AllocateMemory)                                                          \
     X(FreeMemory)                                                              \
     X(BindImageMemory)                                                         \
@@ -239,6 +246,10 @@ struct Slot {
     VkSemaphore drawn[kMaxMultiplier] = {};
     VkFence fence = VK_NULL_HANDLE;
     VkQueryPool queries = VK_NULL_HANDLE;
+    VkBuffer camera = VK_NULL_HANDLE;       // camera mode: the fitted model, for the log
+    VkDeviceMemory camera_memory = VK_NULL_HANDLE;
+    const float *camera_data = nullptr;
+    bool camera_valid = false;
     int generated = 0; // generated frames recorded in the last use
     bool used = false;
 };
@@ -254,6 +265,10 @@ struct Stats {
     int copy_n = 0, gen_n = 0, motion_n = 0;
     double extra_cpu_ms = 0, extra_cpu_ms_max = 0;
     int generated = 0;
+    // Camera mode, per real frame: pan in pixels, zoom and roll in percent
+    // and degrees, share of blocks that agree with the camera and that move.
+    double pan = 0, pan_max = 0, zoom = 0, roll = 0, agree = 0, moving = 0;
+    int camera_n = 0;
 };
 
 // FRAMEWARP_MULT=auto: how many frames to generate per real frame. Every
@@ -538,6 +553,8 @@ void destroy_resources(SwapchainData *sc)
         }
         if (s.fence) d->DestroyFence(dv, s.fence, nullptr);
         if (s.queries) d->DestroyQueryPool(dv, s.queries, nullptr);
+        if (s.camera) d->DestroyBuffer(dv, s.camera, nullptr);
+        if (s.camera_memory) d->FreeMemory(dv, s.camera_memory, nullptr);
         s = Slot{};
     }
     if (sc->cmd_pool) d->DestroyCommandPool(dv, sc->cmd_pool, nullptr);
@@ -660,7 +677,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     if (!create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion_raw) ||
         !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion) ||
         !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->luma_extent, storage, sc->pixel_motion) ||
-        !create_image(d, VK_FORMAT_R32G32B32A32_SFLOAT, {2, 1}, storage, sc->camera))
+        !create_image(d, VK_FORMAT_R32G32B32A32_SFLOAT, {2, 1}, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, sc->camera))
         return false;
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -863,6 +880,26 @@ bool create_resources(SwapchainData *sc, uint32_t family)
             qci.queryCount = 2 * (kMaxMultiplier + 1);
             CHECK(d->CreateQueryPool(dv, &qci, nullptr, &s.queries));
         }
+        if (g_cfg.mode >= 3) {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = 2 * 4 * sizeof(float);
+            bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            CHECK(d->CreateBuffer(dv, &bci, nullptr, &s.camera));
+            VkMemoryRequirements req;
+            d->GetBufferMemoryRequirements(dv, s.camera, &req);
+            int type = find_memory(d, req.memoryTypeBits,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (type < 0)
+                return false;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = (uint32_t)type;
+            CHECK(d->AllocateMemory(dv, &mai, nullptr, &s.camera_memory));
+            CHECK(d->BindBufferMemory(dv, s.camera, s.camera_memory, 0));
+            void *data;
+            CHECK(d->MapMemory(dv, s.camera_memory, 0, VK_WHOLE_SIZE, 0, &data));
+            s.camera_data = static_cast<const float *>(data);
+        }
     }
     sc->ready = true;
     logf("swapchain %ux%u format %d, %zu images, present mode %d, timestamps %d",
@@ -977,6 +1014,24 @@ void collect_timestamps(SwapchainData *sc, Slot &s)
     }
 }
 
+void collect_camera(SwapchainData *sc, Slot &s)
+{
+    if (!s.camera_valid)
+        return;
+    s.camera_valid = false;
+    const float *v = s.camera_data; // a11 a12 bx agree, a21 a22 by moving
+    double h = sc->extent.height;
+    Stats &st = sc->stats;
+    double pan = std::hypot(v[2], v[6]);
+    st.pan += pan;
+    st.pan_max = std::max(st.pan_max, pan);
+    st.zoom += (v[0] + v[5]) * 0.5 / h * 100.0;
+    st.roll += (v[4] - v[1]) * 0.5 / h * 57.29578;
+    st.agree += v[3];
+    st.moving += v[7];
+    st.camera_n++;
+}
+
 void report(SwapchainData *sc, double t)
 {
     Stats &st = sc->stats;
@@ -990,6 +1045,12 @@ void report(SwapchainData *sc, double t)
          st.gen_n ? st.gen_ms / st.gen_n : 0.0,
          st.gen_ms_max, st.real ? st.extra_cpu_ms / st.real : 0.0, st.extra_cpu_ms_max,
          g_cfg.auto_mult ? (" | generating " + std::to_string(sc->auto_mult.generated) + " per frame").c_str() : "");
+    if (st.camera_n) {
+        double n = st.camera_n;
+        logf("  camera per real frame: pan %.1f px (max %.1f), zoom %+.2f%%, roll %+.2f deg | blocks that move "
+             "%.0f%%, that agree with the camera %.0f%%",
+             st.pan / n, st.pan_max, st.zoom / n, st.roll / n, st.moving / n * 100.0, st.agree / n * 100.0);
+    }
     double last = st.last_real;
     st = Stats{};
     st.window_start = t;
@@ -1041,10 +1102,20 @@ VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->filter_pipeline);
     d->CmdDispatch(cmd, (sc->motion_extent.width + 7) / 8, (sc->motion_extent.height + 7) / 8, 1);
     memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
-    if (g_cfg.mode == 3) {
+    if (g_cfg.mode >= 3) {
         d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->global_pipeline);
         d->CmdDispatch(cmd, 1, 1, 1);
-        memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
+        memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       shaders | VK_PIPELINE_STAGE_TRANSFER_BIT, rw | VK_ACCESS_TRANSFER_READ_BIT);
+        if (sc->has_prev && s.camera) {
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {2, 1, 1};
+            d->CmdCopyImageToBuffer(cmd, sc->camera.image, VK_IMAGE_LAYOUT_GENERAL, s.camera, 1, &region);
+            memory_barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+            s.camera_valid = true;
+        }
     }
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->refine_pipeline);
     d->CmdDispatch(cmd, (sc->luma_extent.width + 7) / 8, (sc->luma_extent.height + 7) / 8, 1);
@@ -1151,6 +1222,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     sc->next_slot = (sc->next_slot + 1) % kRing;
     d->WaitForFences(d->device, 1, &s.fence, VK_TRUE, UINT64_MAX);
     collect_timestamps(sc, s);
+    collect_camera(sc, s);
     d->ResetFences(d->device, 1, &s.fence);
     s.used = true;
     s.generated = 0;

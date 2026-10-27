@@ -97,7 +97,7 @@ per second, and the controls answered as without the layer.
 | `FRAMEWARP_MAX_MULT` | `3` | with `auto`, the most frames shown per real frame |
 | `FRAMEWARP_REFRESH` | `60` | the panel's refresh rate, for `auto` |
 | `FRAMEWARP_FORCE_FIFO` | `1` | forces FIFO presents, so every frame gets its own refresh |
-| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `copy` repeats the last real frame (no motion); `debug` warps and colours the motion it found |
+| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `camera-debug` does the same and colours the generated frames: blue where it keeps the picture still, yellow where the camera moves it less than 2 pixels per real frame; `copy` repeats the last real frame (no motion); `debug` warps and colours the motion it found |
 | `FRAMEWARP_ZERO_BIAS` | `0.05` | 0 to 0.5, how much a block prefers "no motion" over a match that is only slightly better (steadier HUD) |
 | `FRAMEWARP_TINT` | `0` | 0 to 1, tints the generated frames magenta to see them |
 | `FRAMEWARP_LOG` | `~/framewarp.log` | where the measurements go |
@@ -112,7 +112,13 @@ real 19.9 fps (worst gap 53.6 ms), shown 59.8 fps, missed 0 | GPU copy 0.23 ms, 
 `real` is what the game renders, `shown` what reaches the swapchain, `missed`
 counts extra frames that could not be shown, and the GPU times are what the
 layer costs per real frame (copy and motion) and per generated frame. With
-`auto` the line ends with how many frames it generates per real frame.
+`auto` the line ends with how many frames it generates per real frame. In
+camera mode a second line shows the camera it found, on average per real
+frame:
+
+```
+  camera per real frame: pan 4.2 px (max 6.2), zoom +0.11%, roll +1.46 deg | blocks that move 67%, that agree with the camera 52%
+```
 
 ## Build
 

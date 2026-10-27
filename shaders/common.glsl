@@ -20,7 +20,8 @@ layout(set = 0, binding = 14) uniform sampler2D camera;   // 2x1: the global mot
 layout(push_constant) uniform Params {
     vec4 tint;      // rgb, a = strength (0 = off)
     float phase;    // how far ahead of the real frame, in real frames
-    int mode;       // 0 = copy, 1 = warp, 2 = warp + motion overlay, 3 = camera
+    int mode;       // 0 = copy, 1 = warp, 2 = warp + motion overlay, 3 = camera,
+                    // 4 = camera + overlay
     int has_prev;   // luma_prev holds a real frame
     float zero_bias;
 } pc;
@@ -28,9 +29,15 @@ layout(push_constant) uniform Params {
 const int kScale = 4;  // luma is 1/4 of the frame size, luma2 1/4 of luma
 const int kBlock = 8;  // motion block, in luma pixels (32 frame pixels)
 
+bool camera_mode()
+{
+    return pc.mode >= 3;
+}
+
 // The camera model: motion(p) = A p + b in frame pixels per real frame, p in
-// frame heights from the centre. camera texel 0 = (a11, a12, b.x),
-// texel 1 = (a21, a22, b.y).
+// frame heights from the centre. camera texel 0 = (a11, a12, b.x, share of
+// the blocks that agree with it), texel 1 = (a21, a22, b.y, share of the
+// blocks that move at all); the shares are only for the log.
 vec2 camera_motion(vec2 frag, vec2 size)
 {
     vec2 p = (frag - 0.5 * size) / size.y;
