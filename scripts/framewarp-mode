@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Switches framewarp's mode while a game runs, by writing its control file
+# (~/.config/framewarp/mode, or $FRAMEWARP_CONTROL). The layer reads it within
+# a quarter of a second.
+#
+# Usage: framewarp-mode                 show the last mode written
+#        framewarp-mode MODE [N|auto]   interp, flow, camera, warp, copy, off,
+#                                       debug or camera-debug; N = frames
+#                                       shown per real frame (1-4)
+#        framewarp-mode next            interp -> flow -> camera -> off -> interp
+set -euo pipefail
+
+file="${FRAMEWARP_CONTROL:-$HOME/.config/framewarp/mode}"
+modes=(interp flow camera warp copy off debug camera-debug)
+
+current() { [ -f "$file" ] && read -r mode _ < "$file" && echo "${mode:-}"; }
+
+case "${1:-}" in
+  "")
+    echo "${file}: $(cat "$file" 2>/dev/null || echo "not written yet")"
+    exit 0
+    ;;
+  -h|--help)
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  next)
+    case "$(current || true)" in
+      interp) set -- flow ;;
+      flow) set -- camera ;;
+      camera) set -- off ;;
+      *) set -- interp ;;
+    esac
+    ;;
+esac
+
+mode="$1"
+if ! printf '%s\n' "${modes[@]}" | grep -qxF "$mode"; then
+  echo "unknown mode '$mode' (one of: ${modes[*]}, next)" >&2
+  exit 1
+fi
+extra="${2:-}"
+if [ -n "$extra" ] && ! [[ "$extra" =~ ^([1-4]|auto)$ ]]; then
+  echo "frames per real frame must be 1-4 or auto, not '$extra'" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$file")"
+echo "$mode${extra:+ $extra}" > "$file.tmp"
+mv "$file.tmp" "$file"
+echo "framewarp: $mode${extra:+ $extra}"

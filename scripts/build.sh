@@ -19,7 +19,11 @@ mkdir -p "$pkg"
 install -m 0755 "$build/libVkLayer_framewarp.so" "$pkg/"
 install -m 0644 "$root/layer/VkLayer_framewarp.json.in" "$pkg/"
 install -m 0755 "$root/scripts/install-armadaos.sh" "$pkg/install.sh"
+install -m 0755 "$root/scripts/framewarp-mode" "$pkg/framewarp-mode"
 install -m 0644 "$root/README.md" "$root/LICENSE" "$pkg/"
+mkdir -p "$pkg/third_party/win-fg"
+install -m 0644 "$root/third_party/win-fg/LICENSE" "$root/third_party/win-fg/NOTICE_FIDELITYFX_OPTICALFLOW.md" \
+  "$root/third_party/win-fg/README.md" "$pkg/third_party/win-fg/"
 echo "$version" > "$pkg/VERSION"
 tar -czf "$out/framewarp-$version-$arch.tar.gz" -C "$(dirname "$pkg")" framewarp
 echo "$out/framewarp-$version-$arch.tar.gz"

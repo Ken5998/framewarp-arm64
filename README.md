@@ -6,7 +6,13 @@ Gen 2, Adreno 740) with ArmadaOS. The first target is
 [Azimuth](https://almost-there-games.itch.io/azimuth) (Forza Horizon 2), which
 is GPU-bound at 20-24 fps there.
 
-## Why not interpolation
+It makes the extra frames in one of several modes, which can be switched
+while the game runs: from its own block motion (`warp`, `camera`), or from the
+optical flow of [win-fg](https://github.com/The412Banner/win-fg), the frame
+generation DroidDeck ships as DD-FG, either pushed forward (`flow`) or
+interpolated like LSFG (`interp`).
+
+## Extrapolation or interpolation
 
 Frame generators such as LSFG, FSR 3 and DLSS-G interpolate: they hold real
 frame N until frame N+1 is done and show a frame in between. At 20 fps that
@@ -19,6 +25,11 @@ game has already rendered. Nothing waits for a future frame, so the layer adds
 no frame of latency, only the wait for the next refresh that v-sync has. The
 generated frames are queued on the GPU right behind the real frame, before the
 game's next frame, so they don't wait for it.
+
+Interpolation still looks better wherever something moves on its own or
+appears from behind something else, because it knows where things end up. So
+`interp` is there too, for games where one more real frame of latency is
+acceptable: at 40-50 real fps it is 20-25 ms, at 20 fps 50 ms.
 
 ## How it works
 
@@ -55,6 +66,32 @@ smear a little where something appears from behind something else, motion is
 found to 4 pixels per real frame, and anything that changes speed shows it a
 frame late.
 
+### Optical flow modes: flow and interp
+
+`FRAMEWARP_MODE=flow` and `FRAMEWARP_MODE=interp` use the optical flow and
+frame synthesis of win-fg (MIT, in `third_party/win-fg`): a luma pyramid of
+seven levels for the last two real frames, a block search on each level from
+the coarsest down, with the camera motion taken out first and an
+edge-preserving smoothing of the result, then one flow vector per pixel.
+
+- `flow` pushes the last real frame forward along that flow, like `warp`:
+  no added latency. Where the flow at the source doesn't explain the real
+  frame from the one before, at the screen edges and on pixels that didn't
+  change (the HUD), it keeps the real frame's pixel.
+- `interp` holds the new real frame back and first shows frames between the
+  previous real frame and it, a third and two thirds of the way with
+  `FRAMEWARP_MULT=3`, warping both towards that time and blending them where
+  the flow agrees, then the real frame. One real frame of latency.
+
+The flow is solved once per real frame and each generated frame only runs
+the synthesis. `FRAMEWARP_FLOW_PRESET` picks how fine the flow is solved (0:
+1/2 size, 1: 1/4, the default, 2: 1/8) and `FRAMEWARP_FLOW_MODEL=4` searches
+the flow in both directions and trusts it only where they agree (sharper on
+complex motion, about twice the work). Upstream win-fg bound its two flow
+images to the synthesis the wrong way round, so every warp sampled from the
+wrong side; framewarp binds them the right way, and `tests/flow_test.cpp`
+checks the result. Their cost on the Retroid Pocket 6 is not measured yet.
+
 ### Camera mode
 
 Where the motion per block goes wrong, when the camera turns, on tyre smoke,
@@ -89,6 +126,27 @@ per second, and the controls answered as without the layer.
 
 `framewarp/install.sh --uninstall` removes it.
 
+## Switching modes while playing
+
+`framewarp-mode` (installed in `~/.local/bin`) writes the control file
+`~/.config/framewarp/mode`, which the layer reads within a quarter of a
+second:
+
+```
+framewarp-mode interp        # interpolation
+framewarp-mode flow 3        # optical flow, pushed forward, 3 frames per real frame
+framewarp-mode camera auto   # camera mode, frames as the game needs
+framewarp-mode off           # only the real frames, to compare
+framewarp-mode next          # interp -> flow -> camera -> off -> interp
+```
+
+Only changes made while the game runs apply, so a file left from another
+game doesn't; each game starts in its `FRAMEWARP_MODE`. The number of frames
+per real frame can't go above what the game started with (`FRAMEWARP_MULT`,
+or `FRAMEWARP_MAX_MULT` with `auto`), since the swapchain only has room for
+those. In Gaming Mode run it over SSH or from a terminal in Desktop Mode for
+now.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -98,7 +156,10 @@ per second, and the controls answered as without the layer.
 | `FRAMEWARP_MAX_MULT` | `3` | with `auto`, the most frames shown per real frame |
 | `FRAMEWARP_REFRESH` | `60` | the panel's refresh rate, for `auto` |
 | `FRAMEWARP_FORCE_FIFO` | `1` | forces FIFO presents, so every frame gets its own refresh |
-| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `camera-debug` does the same and colours the generated frames: blue where it keeps the picture still, yellow where the camera moves it less than 2 pixels per real frame; `copy` repeats the last real frame (no motion); `debug` warps and colours the motion it found |
+| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `camera-debug` does the same and colours the generated frames: blue where it keeps the picture still, yellow where the camera moves it less than 2 pixels per real frame; `flow` pushes the frame along win-fg's optical flow; `interp` interpolates with it (one real frame of latency); `copy` repeats the last real frame; `debug` overlays the block motion; `off` shows only the real frames |
+| `FRAMEWARP_FLOW_PRESET` | `1` | `flow` and `interp`: flow solved at 1/2 (`0`), 1/4 (`1`) or 1/8 (`2`) size |
+| `FRAMEWARP_FLOW_MODEL` | `3` | `flow` and `interp`: `4` searches the flow both ways and trusts it where they agree |
+| `FRAMEWARP_CONTROL` | `~/.config/framewarp/mode` | the control file `framewarp-mode` writes |
 | `FRAMEWARP_ZERO_BIAS` | `0.05` | 0 to 0.5, how much a block prefers "no motion" over a match that is only slightly better (steadier HUD) |
 | `FRAMEWARP_TINT` | `0` | 0 to 1, tints the generated frames magenta to see them |
 | `FRAMEWARP_LOG` | `~/framewarp.log` | where the measurements go |
@@ -132,11 +193,17 @@ It needs CMake, a C++17 compiler, the Vulkan headers and loader, and
 moved by known amounts, everywhere or in one half only, and checks the motion
 they find per block and per pixel; it also zooms the pattern and keeps a still
 strip at the bottom, like a HUD, or adds perspective, and checks the camera
-motion and which pixels camera mode keeps still. CI builds the aarch64
-package in Fedora 44, the base of ArmadaOS, runs that test and runs vkcube
-through the layer with the validation layer below it, on Mesa's software
-driver.
+motion and which pixels camera mode keeps still. `build/flow_test` runs
+win-fg's flow on such a pair and checks that the frames it interpolates and
+extrapolates are much closer to the pattern moved by that much than a repeat
+of the last frame, and that the still strip stays. CI builds the aarch64
+package in Fedora 44, the base of ArmadaOS, runs both tests, runs vkcube
+through the layer in every mode with the validation layer below it, on Mesa's
+software driver, and runs it once more while `framewarp-mode` switches modes
+and multipliers every few seconds.
 
 ## License
 
-MIT.
+MIT. `third_party/win-fg` is win-fg by The412Banner, MIT, with an
+adaptation of the AMD FidelityFX FSR3 optical flow, MIT; see its README for
+what framewarp changed.
