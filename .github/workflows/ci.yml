@@ -63,9 +63,11 @@ jobs:
           export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true FRAMEWARP_CONTROL=/tmp/fw-control
           (for m in "interp" "flow 2" "camera" "off" "warp 4" "interp auto"; do
              sleep 4; scripts/framewarp-mode $m; done) &
+          switcher=$!
           FRAMEWARP_MODE=warp FRAMEWARP_MULT=4 FRAMEWARP_LOG=/tmp/fw-switch.log FRAMEWARP_LOG_EVERY=1 \
             timeout 60 vkcube --c 2000 > /tmp/vkcube-switch.txt 2>&1 || [ $? = 124 ]
-          wait
+          wait $switcher
+          kill %1 || true
           cat /tmp/vkcube-switch.txt
           if grep -q -i -E "validation (error|warning)|VUID" /tmp/vkcube-switch.txt; then exit 1; fi
           test "$(grep -c "^control file" /tmp/fw-switch.log)" -ge 4
