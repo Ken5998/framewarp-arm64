@@ -20,8 +20,24 @@ foreach(shader fullscreen.vert warp.frag luma.comp pyramid.comp motion.comp filt
     list(APPEND SHADER_HEADERS ${out})
 endforeach()
 
-add_library(framewarp SHARED src/framewarp.cpp ${SHADER_HEADERS})
+# The optical flow and synthesis of win-fg (third_party/win-fg, MIT).
+set(WINFG_DIR ${CMAKE_SOURCE_DIR}/third_party/win-fg)
+set(WINFG_HEADERS)
+foreach(shader of3_luma of3_downsample of3_flow of3_expand of3_flow_m4 of3_expand_m4 of3_gm_reduce of3_gm_prewarp
+        of3_flowreg wfg_synth)
+    set(out ${CMAKE_BINARY_DIR}/shaders/${shader}_comp.h)
+    add_custom_command(
+        OUTPUT ${out}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${GLSLANG} -V -S comp --vn ${shader}_comp -o ${out} ${WINFG_DIR}/shaders/${shader}.comp
+        DEPENDS ${WINFG_DIR}/shaders/${shader}.comp)
+    list(APPEND WINFG_HEADERS ${out})
+endforeach()
+set_source_files_properties(${WINFG_DIR}/src/framegen.cpp PROPERTIES COMPILE_OPTIONS "-w")
+
+add_library(framewarp SHARED src/framewarp.cpp ${WINFG_DIR}/src/framegen.cpp ${SHADER_HEADERS} ${WINFG_HEADERS})
 target_include_directories(framewarp PRIVATE ${CMAKE_BINARY_DIR}/shaders)
+target_include_directories(framewarp SYSTEM PRIVATE ${WINFG_DIR}/src)
 target_link_libraries(framewarp PRIVATE Vulkan::Headers)
 # Steam's runtime container may ship an older libstdc++ than the host.
 target_link_options(framewarp PRIVATE -static-libstdc++ -static-libgcc -Wl,--no-undefined)
@@ -38,4 +54,9 @@ if(FRAMEWARP_TESTS)
     target_include_directories(motion_test PRIVATE ${CMAKE_BINARY_DIR}/shaders)
     target_link_libraries(motion_test PRIVATE Vulkan::Vulkan)
     add_test(NAME motion COMMAND motion_test)
+    add_executable(flow_test tests/flow_test.cpp ${WINFG_DIR}/src/framegen.cpp ${WINFG_HEADERS})
+    target_include_directories(flow_test PRIVATE ${CMAKE_BINARY_DIR}/shaders)
+    target_include_directories(flow_test SYSTEM PRIVATE ${WINFG_DIR}/src)
+    target_link_libraries(flow_test PRIVATE Vulkan::Vulkan)
+    add_test(NAME flow COMMAND flow_test)
 endif()

@@ -11,6 +11,13 @@
 // one vblank, so on a 60 Hz panel multiplier 3 shows 60 frames per second
 // out of 20 real ones. The generated frames are queued right behind the real
 // frame, so they never wait behind the next frame's GPU work.
+//
+// Besides its own block motion (warp and camera modes) it carries the optical
+// flow of win-fg (third_party/win-fg, the engine DroidDeck ships as DD-FG):
+// mode "flow" pushes the last real frame forward along that flow, mode
+// "interp" holds the real frame back and shows frames between the previous
+// and the new one, like LSFG. A control file switches modes while the game
+// runs.
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -23,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/stat.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,6 +38,7 @@
 #include <vector>
 
 #include "filter_comp.h"
+#include "framegen.hpp"
 #include "fullscreen_vert.h"
 #include "global_comp.h"
 #include "luma_comp.h"
@@ -47,12 +56,43 @@ constexpr int kRing = 8;
 
 // ---------------------------------------------------------------- config
 
+// Modes, as FRAMEWARP_MODE or the control file name them.
+enum Mode {
+    kCopy = 0,        // repeat the last real frame
+    kWarp = 1,        // block motion, per pixel
+    kWarpDebug = 2,   // the same with a motion overlay
+    kCamera = 3,      // one smooth camera motion
+    kCameraDebug = 4, // the same with an overlay
+    kFlow = 5,        // win-fg optical flow, extrapolated
+    kInterp = 6,      // win-fg optical flow, interpolated (one real frame of latency)
+    kOff = 7,         // only the real frames
+};
+
+const char *const kModeNames[] = {"copy", "warp", "debug", "camera", "camera-debug", "flow", "interp", "off"};
+
+int parse_mode(const char *name)
+{
+    for (int i = 0; i < (int)(sizeof kModeNames / sizeof kModeNames[0]); i++)
+        if (!strcmp(name, kModeNames[i]))
+            return i;
+    if (!strcmp(name, "extrap"))
+        return kFlow;
+    return -1;
+}
+
+bool uses_flow(int mode) { return mode == kFlow || mode == kInterp; }
+bool uses_motion(int mode) { return mode >= kWarp && mode <= kCameraDebug; }
+
 struct Config {
     int multiplier = 2;    // with auto: the most frames shown per real frame
+    int reserve = 2;       // frames per real frame the swapchain has room for
     bool auto_mult = false;
     double refresh = 1.0 / 60.0;
     bool force_fifo = true;
-    int mode = 1; // 0 = copy, 1 = warp, 2 = warp + motion overlay, 3 = camera, 4 = camera + overlay
+    int mode = kWarp;
+    int flow_model = 3;    // win-fg: 3 = symmetric flow, 4 = forward and backward flow
+    int flow_preset = 1;   // win-fg: 0 = finest flow (1/2 size), 1 = 1/4, 2 = 1/8
+    std::string control_path;
     float zero_bias = 0.05f;
     float tint = 0.0f;
     double log_every = 2.0;
@@ -87,8 +127,15 @@ void load_config()
         }
         g_cfg.refresh = 1.0 / std::clamp(env_float("FRAMEWARP_REFRESH", 60.0f), 24.0f, 240.0f);
         g_cfg.force_fifo = env_int("FRAMEWARP_FORCE_FIFO", 1) != 0;
-        if (const char *m = getenv("FRAMEWARP_MODE"); m && *m)
-            g_cfg.mode = !strcmp(m, "copy") ? 0 : !strcmp(m, "debug") ? 2 : !strcmp(m, "camera") ? 3 : !strcmp(m, "camera-debug") ? 4 : 1;
+        g_cfg.reserve = g_cfg.multiplier;
+        if (const char *m = getenv("FRAMEWARP_MODE"); m && *m && parse_mode(m) >= 0)
+            g_cfg.mode = parse_mode(m);
+        g_cfg.flow_model = env_int("FRAMEWARP_FLOW_MODEL", 3) == 4 ? 4 : 3;
+        g_cfg.flow_preset = std::clamp(env_int("FRAMEWARP_FLOW_PRESET", 1), 0, 2);
+        if (const char *p = getenv("FRAMEWARP_CONTROL"); p && *p)
+            g_cfg.control_path = p;
+        else if (const char *home = getenv("HOME"); home && *home)
+            g_cfg.control_path = std::string(home) + "/.config/framewarp/mode";
         g_cfg.zero_bias = std::clamp(env_float("FRAMEWARP_ZERO_BIAS", 0.05f), 0.0f, 0.5f);
         g_cfg.tint = std::clamp(env_float("FRAMEWARP_TINT", 0.0f), 0.0f, 1.0f);
         g_cfg.log_every = std::max(0.5f, env_float("FRAMEWARP_LOG_EVERY", 2.0f));
@@ -121,6 +168,69 @@ double now_s()
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+// The control file: one line such as "interp", "flow 3" or "warp auto",
+// a mode and optionally the frames per real frame. Read when it changes
+// while the game runs, so a file left from another game doesn't apply.
+struct Control {
+    std::mutex mutex;
+    double next_check = 0;
+    bool primed = false;
+    timespec mtime{};
+    off_t size = -1;
+};
+Control g_control;
+
+void poll_control(double t)
+{
+    if (g_cfg.control_path.empty())
+        return;
+    std::lock_guard<std::mutex> lock(g_control.mutex);
+    if (t < g_control.next_check)
+        return;
+    g_control.next_check = t + 0.25;
+    struct stat st;
+    bool exists = stat(g_cfg.control_path.c_str(), &st) == 0;
+    timespec mt = exists ? st.st_mtim : timespec{};
+    off_t size = exists ? st.st_size : -1;
+    bool changed = mt.tv_sec != g_control.mtime.tv_sec || mt.tv_nsec != g_control.mtime.tv_nsec ||
+                   size != g_control.size;
+    g_control.mtime = mt;
+    g_control.size = size;
+    if (!g_control.primed) {
+        g_control.primed = true;
+        return;
+    }
+    if (!changed || !exists)
+        return;
+    FILE *f = fopen(g_cfg.control_path.c_str(), "r");
+    if (!f)
+        return;
+    char buf[128] = {};
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    int mode = -1, mult = 0;
+    bool automatic = false;
+    for (char *tok = strtok(buf, " \t\r\n"); tok; tok = strtok(nullptr, " \t\r\n")) {
+        if (parse_mode(tok) >= 0)
+            mode = parse_mode(tok);
+        else if (!strcmp(tok, "auto"))
+            automatic = true;
+        else if (atoi(tok) >= 1 && atoi(tok) <= kMaxMultiplier)
+            mult = atoi(tok);
+    }
+    if (mode >= 0)
+        g_cfg.mode = mode;
+    if (automatic)
+        g_cfg.auto_mult = true;
+    else if (mult) {
+        g_cfg.auto_mult = false;
+        g_cfg.multiplier = std::min(mult, g_cfg.reserve);
+    }
+    logf("control file: mode %s, %s%d frames per real frame", kModeNames[g_cfg.mode],
+         g_cfg.auto_mult ? "auto up to " : "", g_cfg.multiplier);
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -227,6 +337,13 @@ struct DeviceData {
     std::vector<VkQueueFamilyProperties> families;
     VkPhysicalDeviceMemoryProperties mem;
     float timestamp_period;
+    // win-fg engine, made the first time a flow mode is used. Its scratch
+    // state is global, so only one device in the process gets one.
+    std::unique_ptr<winfg::FrameGen> fg;
+    winfg::DeviceDispatch fgd;
+    winfg::InstanceDispatch fgi;
+    bool fg_failed = false;
+    VkExtent2D fg_extent{};
 };
 
 struct QueueData {
@@ -355,10 +472,14 @@ struct SwapchainData {
     Image motion;        // the same after the median filter
     Image pixel_motion;  // per luma pixel, picked among the block vectors
     Image camera;        // one smooth motion for the whole frame, 4x1
+    Image generated;     // the frame win-fg generates (rgba8), drawn into the swapchain image
     VkExtent2D luma_extent{}, luma2_extent{}, motion_extent{};
     bool initialized = false;
     int cur = 0;         // history slot of the last real frame
-    bool has_prev = false;
+    bool has_prev = false;  // the motion analysis has the previous real frame
+    int real_frames = 0;    // real frames in history since the images were initialized
+    uint32_t flow_frames = 0;
+    int fw_mode = kWarp;    // the mode of the present being handled
     VkSampler sampler = VK_NULL_HANDLE;         // linear
     VkSampler sampler_nearest = VK_NULL_HANDLE; // for formats without linear filtering
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
@@ -487,8 +608,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkD
     VkPhysicalDeviceProperties props;
     inst->GetPhysicalDeviceProperties(physical, &props);
     data->timestamp_period = props.limits.timestampPeriod;
-    logf("device %s, multiplier %s%d, mode %d, zero bias %.2f, force_fifo %d", props.deviceName,
-         g_cfg.auto_mult ? "auto up to " : "", g_cfg.multiplier, g_cfg.mode, g_cfg.zero_bias, g_cfg.force_fifo);
+    logf("device %s, multiplier %s%d, mode %s, zero bias %.2f, force_fifo %d, control file %s", props.deviceName,
+         g_cfg.auto_mult ? "auto up to " : "", g_cfg.multiplier, kModeNames[g_cfg.mode], g_cfg.zero_bias,
+         g_cfg.force_fifo, g_cfg.control_path.empty() ? "none" : g_cfg.control_path.c_str());
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_devices[key(*out)] = std::move(data);
@@ -500,6 +622,8 @@ VKAPI_ATTR void VKAPI_CALL DestroyDevice(VkDevice device, const VkAllocationCall
     DeviceData *dev = device_of(key(device));
     if (!dev)
         return;
+    if (dev->fg)
+        dev->fg->destroy();
     dev->DestroyDevice(device, alloc);
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto it = g_queues.begin(); it != g_queues.end();)
@@ -570,7 +694,7 @@ void destroy_resources(SwapchainData *sc)
     if (sc->sampler) d->DestroySampler(dv, sc->sampler, nullptr);
     if (sc->sampler_nearest) d->DestroySampler(dv, sc->sampler_nearest, nullptr);
     for (Image *img : {&sc->history[0], &sc->history[1], &sc->luma[0], &sc->luma[1], &sc->luma2[0], &sc->luma2[1],
-                        &sc->motion_raw, &sc->motion, &sc->pixel_motion, &sc->camera}) {
+                        &sc->motion_raw, &sc->motion, &sc->pixel_motion, &sc->camera, &sc->generated}) {
         if (img->view) d->DestroyImageView(dv, img->view, nullptr);
         if (img->image) d->DestroyImage(dv, img->image, nullptr);
         if (img->memory) d->FreeMemory(dv, img->memory, nullptr);
@@ -584,6 +708,7 @@ void destroy_resources(SwapchainData *sc)
     sc->set_layout = VK_NULL_HANDLE;
     sc->sampler = sc->sampler_nearest = VK_NULL_HANDLE;
     sc->initialized = sc->has_prev = false;
+    sc->real_frames = 0;
     sc->framebuffers.clear();
     sc->views.clear();
     sc->cmd_pool = VK_NULL_HANDLE;
@@ -677,7 +802,8 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     if (!create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion_raw) ||
         !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->motion_extent, storage, sc->motion) ||
         !create_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, sc->luma_extent, storage, sc->pixel_motion) ||
-        !create_image(d, VK_FORMAT_R32G32B32A32_SFLOAT, {4, 1}, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, sc->camera))
+        !create_image(d, VK_FORMAT_R32G32B32A32_SFLOAT, {4, 1}, storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, sc->camera) ||
+        !create_image(d, VK_FORMAT_R8G8B8A8_UNORM, sc->extent, storage, sc->generated))
         return false;
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -691,7 +817,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     const VkDescriptorType sampled = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     const VkDescriptorType image = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const VkDescriptorType types[] = {sampled, sampled, sampled, image, image, image, sampled,
-                                      sampled, sampled, image, sampled, image, sampled, image, sampled};
+                                      sampled, sampled, image, sampled, image, sampled, image, sampled, sampled};
     constexpr uint32_t kBindings = sizeof types / sizeof types[0];
     VkDescriptorSetLayoutBinding b[kBindings];
     for (uint32_t i = 0; i < kBindings; i++)
@@ -700,7 +826,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
     dlci.bindingCount = kBindings;
     dlci.pBindings = b;
     CHECK(d->CreateDescriptorSetLayout(dv, &dlci, nullptr, &sc->set_layout));
-    VkDescriptorPoolSize ps[2] = {{sampled, 18}, {image, 12}};
+    VkDescriptorPoolSize ps[2] = {{sampled, 20}, {image, 12}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 2;
     dpci.poolSizeCount = 2;
@@ -717,7 +843,8 @@ bool create_resources(SwapchainData *sc, uint32_t family)
                                               sc->luma[c].view, sc->motion_raw.view, sc->motion.view,
                                               sc->motion.view, sc->luma2[c].view, sc->luma2[1 - c].view,
                                               sc->luma2[c].view, sc->history[1 - c].view, sc->pixel_motion.view,
-                                              sc->pixel_motion.view, sc->camera.view, sc->camera.view};
+                                              sc->pixel_motion.view, sc->camera.view, sc->camera.view,
+                                              sc->generated.view};
         VkDescriptorImageInfo info[kBindings];
         VkWriteDescriptorSet w[kBindings];
         for (uint32_t i = 0; i < kBindings; i++) {
@@ -880,7 +1007,8 @@ bool create_resources(SwapchainData *sc, uint32_t family)
             qci.queryCount = 2 * (kMaxMultiplier + 1);
             CHECK(d->CreateQueryPool(dv, &qci, nullptr, &s.queries));
         }
-        if (g_cfg.mode >= 3) {
+        {
+            // The modes can change while the game runs, so always.
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bci.size = 4 * 4 * sizeof(float);
             bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -913,11 +1041,11 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
 {
     DeviceData *dev = device_of(key(device));
     VkSwapchainCreateInfoKHR info = *ci;
-    if (g_cfg.multiplier > 1) {
+    if (g_cfg.reserve > 1) {
         VkSurfaceCapabilitiesKHR caps{};
         dev->inst->GetPhysicalDeviceSurfaceCapabilitiesKHR(dev->physical, ci->surface, &caps);
         // Room for the extra frames this layer keeps in flight.
-        info.minImageCount += (uint32_t)g_cfg.multiplier - 1;
+        info.minImageCount += (uint32_t)g_cfg.reserve - 1;
         if (caps.maxImageCount && info.minImageCount > caps.maxImageCount)
             info.minImageCount = caps.maxImageCount;
         info.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -927,7 +1055,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
             info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     }
     VkResult r = dev->CreateSwapchainKHR(device, &info, alloc, out);
-    if (r != VK_SUCCESS || g_cfg.multiplier <= 1)
+    if (r != VK_SUCCESS || g_cfg.reserve <= 1)
         return r;
 
     auto sc = std::make_unique<SwapchainData>();
@@ -1062,7 +1190,7 @@ void report(SwapchainData *sc, double t)
 
 PushConstants push_constants(SwapchainData *sc, float phase)
 {
-    return PushConstants{{1.0f, 0.0f, 1.0f, g_cfg.tint}, phase, g_cfg.mode, sc->has_prev ? 1 : 0, g_cfg.zero_bias};
+    return PushConstants{{1.0f, 0.0f, 1.0f, g_cfg.tint}, phase, sc->fw_mode, sc->has_prev ? 1 : 0, g_cfg.zero_bias};
 }
 
 void memory_barrier(DeviceData *d, VkCommandBuffer cmd, VkPipelineStageFlags src, VkAccessFlags src_access,
@@ -1105,7 +1233,7 @@ VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->filter_pipeline);
     d->CmdDispatch(cmd, (sc->motion_extent.width + 7) / 8, (sc->motion_extent.height + 7) / 8, 1);
     memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, shaders, rw);
-    if (g_cfg.mode >= 3) {
+    if (sc->fw_mode >= kCamera) {
         d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sc->global_pipeline);
         d->CmdDispatch(cmd, 1, 1, 1);
         memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -1133,8 +1261,127 @@ VkResult submit_analysis(SwapchainData *sc, VkQueue queue, Slot &s)
     return d->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
 }
 
-VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, int shown_per_real, uint32_t image,
-                           VkSemaphore wait, VkSemaphore signal)
+// win-fg engine of the device, made and sized for this swapchain; null when
+// it can't be had (then the flow modes fall back to copy).
+winfg::FrameGen *flow_engine(SwapchainData *sc, VkQueue queue, const Slot *current)
+{
+    static std::mutex owner_mutex;
+    static DeviceData *owner = nullptr;
+    DeviceData *d = sc->dev;
+    if (d->fg_failed)
+        return nullptr;
+    if (!d->fg) {
+        {
+            std::lock_guard<std::mutex> lock(owner_mutex);
+            if (owner && owner != d) {
+                d->fg_failed = true;
+                logf("win-fg: another device of this process has the flow engine, no flow modes here");
+                return nullptr;
+            }
+            owner = d;
+        }
+#define FG_LOAD(name) d->fgd.name = (PFN_vk##name)d->gdpa(d->device, "vk" #name);
+        FG_LOAD(GetDeviceProcAddr) FG_LOAD(DestroyDevice) FG_LOAD(GetDeviceQueue) FG_LOAD(QueueSubmit)
+        FG_LOAD(QueueWaitIdle) FG_LOAD(DeviceWaitIdle) FG_LOAD(CreateImage) FG_LOAD(DestroyImage)
+        FG_LOAD(CreateImageView) FG_LOAD(DestroyImageView) FG_LOAD(AllocateMemory) FG_LOAD(FreeMemory)
+        FG_LOAD(BindImageMemory) FG_LOAD(GetImageMemoryRequirements) FG_LOAD(CreateBuffer) FG_LOAD(DestroyBuffer)
+        FG_LOAD(GetBufferMemoryRequirements) FG_LOAD(BindBufferMemory) FG_LOAD(MapMemory) FG_LOAD(UnmapMemory)
+        FG_LOAD(CreateSampler) FG_LOAD(DestroySampler) FG_LOAD(CreateShaderModule) FG_LOAD(DestroyShaderModule)
+        FG_LOAD(CreateDescriptorSetLayout) FG_LOAD(DestroyDescriptorSetLayout) FG_LOAD(CreatePipelineLayout)
+        FG_LOAD(DestroyPipelineLayout) FG_LOAD(CreateComputePipelines) FG_LOAD(DestroyPipeline)
+        FG_LOAD(CreateDescriptorPool) FG_LOAD(DestroyDescriptorPool) FG_LOAD(ResetDescriptorPool)
+        FG_LOAD(AllocateDescriptorSets) FG_LOAD(UpdateDescriptorSets) FG_LOAD(CmdBindPipeline)
+        FG_LOAD(CmdBindDescriptorSets) FG_LOAD(CmdDispatch) FG_LOAD(CmdPipelineBarrier) FG_LOAD(CmdCopyImage)
+        FG_LOAD(CmdClearColorImage) FG_LOAD(CmdPushConstants)
+#undef FG_LOAD
+        d->fgi.GetInstanceProcAddr = d->inst->gipa;
+        d->fgi.GetPhysicalDeviceMemoryProperties = d->inst->GetPhysicalDeviceMemoryProperties;
+        d->fgi.GetPhysicalDeviceQueueFamilyProperties = d->inst->GetPhysicalDeviceQueueFamilyProperties;
+        d->fgi.GetPhysicalDeviceProperties = d->inst->GetPhysicalDeviceProperties;
+        auto fg = std::make_unique<winfg::FrameGen>();
+        winfg::Config c;
+        c.model = g_cfg.flow_model;
+        c.perfPreset = g_cfg.flow_preset;
+        fg->configure(c);
+        if (!fg->init(&d->fgd, &d->fgi, d->physical, d->device, sc->family, queue)) {
+            fg->destroy();
+            d->fg_failed = true;
+            logf("win-fg: the flow engine failed to start, flow modes show copies");
+            return nullptr;
+        }
+        d->fg = std::move(fg);
+        logf("win-fg: flow engine ready (model %d, preset %d)", g_cfg.flow_model, g_cfg.flow_preset);
+    }
+    if (d->fg_extent.width != sc->extent.width || d->fg_extent.height != sc->extent.height) {
+        if (d->fg_extent.width) {
+            // Sized before: frames still in flight may use the old images.
+            // Waiting for the layer's own work is enough (and a device-wide
+            // wait while the game holds an acquired image upsets the
+            // validation layer's present tracking).
+            std::vector<VkFence> fences;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for (auto &it : g_swapchains)
+                    if (it.second->dev == d)
+                        for (Slot &slot : it.second->slots)
+                            if (slot.used && slot.fence && &slot != current) // current: reset, not yet submitted
+                                fences.push_back(slot.fence);
+            }
+            if (!fences.empty())
+                d->WaitForFences(d->device, (uint32_t)fences.size(), fences.data(), VK_TRUE, UINT64_MAX);
+            d->fg->resetScratch();
+        }
+        if (!d->fg->onResize(sc->extent, sc->format, true)) {
+            d->fg->destroy();
+            d->fg.reset();
+            d->fg_failed = true;
+            logf("win-fg: can't size the flow engine to %ux%u, flow modes show copies", sc->extent.width,
+                 sc->extent.height);
+            return nullptr;
+        }
+        d->fg_extent = sc->extent;
+    }
+    return d->fg.get();
+}
+
+// The flow between the last two real frames, on the analysis command buffer.
+// The previous present's work must be done first: the engine rewrites its
+// descriptors and reads back its global motion estimate.
+bool submit_flow(SwapchainData *sc, VkQueue queue, Slot &s, int slot_index)
+{
+    DeviceData *d = sc->dev;
+    if (sc->real_frames < 2)
+        return false;
+    winfg::FrameGen *fg = flow_engine(sc, queue, &s);
+    if (!fg)
+        return false;
+    Slot &prev = sc->slots[(slot_index + kRing - 1) % kRing];
+    if (prev.used)
+        d->WaitForFences(d->device, 1, &prev.fence, VK_TRUE, UINT64_MAX);
+    VkCommandBuffer cmd = s.cmd[kAnalysis];
+    d->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    d->BeginCommandBuffer(cmd, &bi);
+    if (sc->timestamps)
+        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.queries, 2 * kAnalysis);
+    fg->recordFlow(cmd, sc->history[1 - sc->cur].view, sc->history[sc->cur].view, sc->generated.view,
+                   sc->flow_frames % winfg::FrameGen::kGmSlots);
+    sc->flow_frames++;
+    if (sc->timestamps)
+        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.queries, 2 * kAnalysis + 1);
+    d->EndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    return d->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+}
+
+// Draws generated frame k into swapchain image `image`. With alpha >= 0 the
+// win-fg engine first writes the frame at that time into sc->generated and
+// the draw shows it; otherwise the draw makes the frame itself (draw_mode).
+VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, float phase, int draw_mode, float alpha,
+                           bool extrapolate, uint32_t image, VkSemaphore wait, VkSemaphore signal)
 {
     DeviceData *d = sc->dev;
     VkCommandBuffer cmd = s.cmd[k];
@@ -1144,6 +1391,16 @@ VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, int
     d->BeginCommandBuffer(cmd, &bi);
     if (sc->timestamps)
         d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.queries, 2 * k);
+
+    if (alpha >= 0.0f && sc->dev->fg) {
+        // The previous generated frame must be drawn before it is overwritten.
+        memory_barrier(d, cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        sc->dev->fg->recordSynth(cmd, alpha, extrapolate);
+        memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
 
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = sc->pass;
@@ -1157,7 +1414,8 @@ VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, int
     d->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->pipeline);
     d->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->layout, 0, 1, &sc->sets[sc->cur], 0,
                              nullptr);
-    PushConstants pc = push_constants(sc, (float)k / (float)shown_per_real);
+    PushConstants pc = push_constants(sc, phase);
+    pc.mode = draw_mode;
     d->CmdPushConstants(cmd, sc->layout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc,
                         &pc);
     d->CmdDraw(cmd, 3, 1, 0, 0);
@@ -1209,19 +1467,26 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         return d->QueuePresentKHR(queue, pi);
 
     double t0 = now_s();
+    poll_control(t0);
+    const int mode = g_cfg.mode;
+    const bool auto_mult = g_cfg.auto_mult;
+    sc->fw_mode = mode;
     Stats &st = sc->stats;
     if (st.window_start == 0)
         st.window_start = t0;
     if (st.last_real > 0) {
         st.interval_max = std::max(st.interval_max, t0 - st.last_real);
-        if (g_cfg.auto_mult)
-            sc->auto_mult.update(t0, t0 - st.last_real, g_cfg.multiplier - 1);
+        if (auto_mult)
+            sc->auto_mult.update(t0, t0 - st.last_real, g_cfg.reserve - 1);
     }
-    const int shown_per_real = g_cfg.auto_mult ? sc->auto_mult.generated + 1 : g_cfg.multiplier;
+    int shown_per_real = auto_mult ? std::min(sc->auto_mult.generated + 1, g_cfg.reserve) : g_cfg.multiplier;
+    if (mode == kOff)
+        shown_per_real = 1;
     st.last_real = t0;
     st.real++;
 
-    Slot &s = sc->slots[sc->next_slot];
+    const int slot_index = sc->next_slot;
+    Slot &s = sc->slots[slot_index];
     sc->next_slot = (sc->next_slot + 1) % kRing;
     d->WaitForFences(d->device, 1, &s.fence, VK_TRUE, UINT64_MAX);
     collect_timestamps(sc, s);
@@ -1245,12 +1510,13 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     if (!sc->initialized) {
         for (Image *img : {&sc->history[0], &sc->history[1], &sc->luma[0], &sc->luma[1], &sc->luma2[0], &sc->luma2[1],
-                        &sc->motion_raw, &sc->motion, &sc->pixel_motion, &sc->camera})
+                        &sc->motion_raw, &sc->motion, &sc->pixel_motion, &sc->camera, &sc->generated})
             image_barrier(d, cmd, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, shaders | VK_PIPELINE_STAGE_TRANSFER_BIT);
         sc->initialized = true;
         sc->has_prev = false;
+        sc->real_frames = 0;
     }
     // The new real frame goes into the other history slot; the frames drawn
     // from it two presents ago must be done reading it.
@@ -1289,20 +1555,18 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         d->QueueSubmit(queue, 0, nullptr, s.fence);
         return r;
     }
+    sc->real_frames = std::min(sc->real_frames + 1, 2);
 
-    // 2. Present the real frame, keeping whatever the game chained to it.
-    VkPresentInfoKHR real = *pi;
-    real.waitSemaphoreCount = 1;
-    real.pWaitSemaphores = &s.copy_done;
-    VkResult result = d->QueuePresentKHR(queue, &real);
-    st.shown += result >= 0;
-
-    // 3. Estimate the motion, then draw and present the generated frames.
+    // 2. The optical flow modes solve the flow between the last two real
+    //    frames first; interpolation needs it before the real frame shows.
     double t1 = now_s();
-    if (result >= 0 && g_cfg.mode != 0 && submit_analysis(sc, queue, s) != VK_SUCCESS)
-        result = VK_ERROR_DEVICE_LOST;
-    sc->has_prev = result >= 0;
-    if (result >= 0) {
+    const bool flow = uses_flow(mode) && shown_per_real > 1 && submit_flow(sc, queue, s, slot_index);
+    const bool interp = flow && mode == kInterp;
+    VkResult result = VK_SUCCESS;
+
+    // 3. Acquire, draw and present the generated frames: interpolated ones
+    //    before the real frame, all others after it.
+    auto present_generated = [&]() {
         for (int k = 1; k < shown_per_real; k++) {
             uint32_t idx;
             VkResult ar = d->AcquireNextImageKHR(d->device, sc->swapchain, 100000000ull, s.acquired[k],
@@ -1313,7 +1577,16 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
                     result = ar;
                 break;
             }
-            if (record_and_submit(sc, queue, s, k, shown_per_real, idx, s.acquired[k], s.drawn[k]) != VK_SUCCESS) {
+            const float phase = (float)k / (float)shown_per_real;
+            int draw_mode = mode;
+            float alpha = -1.0f;
+            if (flow) {
+                alpha = interp ? phase : 1.0f + phase;
+            } else if (uses_flow(mode) || mode == kOff || !sc->has_prev) {
+                draw_mode = kCopy; // no flow yet (first frame) or no engine
+            }
+            if (record_and_submit(sc, queue, s, k, phase, draw_mode, alpha, !interp, idx, s.acquired[k],
+                                  s.drawn[k]) != VK_SUCCESS) {
                 st.missed++;
                 break;
             }
@@ -1334,6 +1607,38 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
             if (er == VK_SUBOPTIMAL_KHR && result == VK_SUCCESS)
                 result = er;
         }
+    };
+
+    if (interp)
+        present_generated();
+
+    // 4. Present the real frame, keeping whatever the game chained to it.
+    VkPresentInfoKHR real = *pi;
+    real.waitSemaphoreCount = 1;
+    real.pWaitSemaphores = &s.copy_done;
+    VkResult rr = d->QueuePresentKHR(queue, &real);
+    st.shown += rr >= 0;
+    if (rr < 0)
+        result = rr;
+    else if (rr == VK_SUBOPTIMAL_KHR && result == VK_SUCCESS)
+        result = rr;
+
+    if (!interp) {
+        // The block motion of the warp and camera modes, then their frames.
+        // sc->has_prev tells the analysis whether the previous real frame
+        // was analysed, and the drawing whether this one was.
+        bool analysed = false;
+        if (result >= 0 && uses_motion(mode) && shown_per_real > 1) {
+            if (submit_analysis(sc, queue, s) != VK_SUCCESS)
+                result = VK_ERROR_DEVICE_LOST;
+            else
+                analysed = true;
+        }
+        sc->has_prev = analysed;
+        if (result >= 0 && mode != kOff)
+            present_generated();
+    } else {
+        sc->has_prev = false;
     }
     d->QueueSubmit(queue, 0, nullptr, s.fence);
 
@@ -1394,4 +1699,15 @@ FW_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL framewarp_GetDeviceProcAddr(V
         return dev->gdpa(device, name) ? fn : nullptr;
     }
     return dev->gdpa(device, name);
+}
+
+// win-fg's log (third_party/win-fg/src/log.hpp) goes to framewarp's.
+void framewarp_winfg_log(const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    logf("win-fg: %s", buf);
 }

@@ -16,12 +16,14 @@ layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D pixel_motion_ou
 layout(set = 0, binding = 12) uniform sampler2D pixel_motion; // per luma pixel
 layout(set = 0, binding = 13, rgba32f) uniform writeonly image2D camera_out;
 layout(set = 0, binding = 14) uniform sampler2D camera;   // 4x1: the global motion model
+layout(set = 0, binding = 15) uniform sampler2D generated; // the frame win-fg generated (flow modes)
 
 layout(push_constant) uniform Params {
     vec4 tint;      // rgb, a = strength (0 = off)
     float phase;    // how far ahead of the real frame, in real frames
     int mode;       // 0 = copy, 1 = warp, 2 = warp + motion overlay, 3 = camera,
-                    // 4 = camera + overlay
+                    // 4 = camera + overlay, 5 and 6 = show the frame win-fg
+                    // generated (flow, interp)
     int has_prev;   // luma_prev holds a real frame
     float zero_bias;
 } pc;
@@ -31,7 +33,7 @@ const int kBlock = 8;  // motion block, in luma pixels (32 frame pixels)
 
 bool camera_mode()
 {
-    return pc.mode >= 3;
+    return pc.mode == 3 || pc.mode == 4;
 }
 
 // The camera model, in frame pixels per real frame, with p in frame heights

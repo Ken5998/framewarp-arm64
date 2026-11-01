@@ -25,6 +25,10 @@ bool unchanged(vec2 at)
 
 void main()
 {
+    if (pc.mode == 5 || pc.mode == 6) {
+        color = vec4(mix(texture(generated, uv).rgb, pc.tint.rgb, pc.tint.a), 1.0);
+        return;
+    }
     vec2 px = 1.0 / vec2(textureSize(frame, 0));
     vec3 here = texture(frame, uv).rgb;
     vec2 m = vec2(0.0);
