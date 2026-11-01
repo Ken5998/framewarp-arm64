@@ -5,13 +5,14 @@
 #
 # Usage: framewarp-mode                 show the last mode written
 #        framewarp-mode MODE [N|auto]   interp, flow, camera, warp, copy, off,
-#                                       debug or camera-debug; N = frames
+#                                       debug, camera-debug or flow-debug;
+#                                       N = frames
 #                                       shown per real frame (1-4)
 #        framewarp-mode next            interp -> flow -> camera -> off -> interp
 set -euo pipefail
 
 file="${FRAMEWARP_CONTROL:-$HOME/.config/framewarp/mode}"
-modes=(interp flow camera warp copy off debug camera-debug)
+modes=(interp flow camera warp copy off debug camera-debug flow-debug)
 
 current() { [ -f "$file" ] && read -r mode _ < "$file" && echo "${mode:-}"; }
 

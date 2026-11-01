@@ -35,7 +35,7 @@ public:
     // slot whose previous use has completed (see updateGlobalMotion()).
     void recordFlow(VkCommandBuffer cmd, VkImageView prevView, VkImageView currView,
                     VkImageView outView, uint32_t gmSlot = 0);
-    void recordSynth(VkCommandBuffer cmd, float alpha, bool extrapolate);
+    void recordSynth(VkCommandBuffer cmd, float alpha, float variant); // 0 interpolate, 1 extrapolate, 2 flow view
     // framewarp: frees the per-size descriptors and uniform buffers, so a
     // resize can rebuild them. The caller waits for the device first.
     void resetScratch();

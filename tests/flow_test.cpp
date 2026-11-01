@@ -308,7 +308,7 @@ int main()
             for (float t : {0.25f, 0.5f, 1.5f}) {
                 cmd = begin();
                 fg.recordFlow(cmd, prev.view, curr.view, out.view, round % winfg::FrameGen::kGmSlots);
-                fg.recordSynth(cmd, t, t > 1.0f);
+                fg.recordSynth(cmd, t, t > 1.0f ? 1.0f : 0.0f);
                 submit(cmd);
                 if (round < 5)
                     continue;
@@ -322,6 +322,34 @@ int main()
                        model, t > 1.0f ? "extrapolated" : "interpolated", t, err, base, strip, ok ? "ok" : "FAIL");
             }
         }
+        // The flow view (framewarp flow-debug): a move right and a bit down
+        // reads orange in the moving part, the still strip stays grey.
+        cmd = begin();
+        fg.recordFlow(cmd, prev.view, curr.view, out.view, 0);
+        fg.recordSynth(cmd, 0.0f, 2.0f);
+        submit(cmd);
+        std::vector<uint8_t> view = download(out, staging);
+        double moving[3] = {}, still = 0;
+        long nm = 0, ns = 0;
+        for (uint32_t y = 140; y < kH - 2; y++)
+            for (uint32_t x = kMargin; x < kW - kMargin; x++) {
+                const uint8_t *p = &view[(y * kW + x) * 4];
+                if (y >= kH - kStrip + 2) {
+                    still += std::abs(p[0] - p[1]) + std::abs(p[1] - p[2]);
+                    ns++;
+                } else if (y < kH - kStrip - kMargin) {
+                    for (int c = 0; c < 3; c++)
+                        moving[c] += p[c];
+                    nm++;
+                }
+            }
+        for (double &m : moving)
+            m /= nm;
+        still /= ns;
+        bool ok = moving[0] > moving[1] + 8 && moving[1] > moving[2] + 8 && still < 1.0;
+        failures += !ok;
+        printf("model %d, flow view: moving part rgb %.0f %.0f %.0f, still strip colour %.2f %s\n", model,
+               moving[0], moving[1], moving[2], still, ok ? "ok" : "FAIL");
         fg.destroy();
     }
     return failures ? 1 : 0;

@@ -319,9 +319,9 @@ void FrameGen::resetScratch() {
     if (device_) destroyScratch(dd_, device_, descPool_);
 }
 
-void FrameGen::recordSynth(VkCommandBuffer cmd, float alpha, bool extrapolate) {
+void FrameGen::recordSynth(VkCommandBuffer cmd, float alpha, float variant) {
     if (!valid() || !g_scratch.built) return;
-    const float pc[2] = {alpha, extrapolate ? 1.0f : 0.0f};
+    const float pc[2] = {alpha, variant};
     dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pSynth_.pipeline);
     dd_->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pSynth_.layout, 0, 1, &g_scratch.sSynth, 0, nullptr);
     dd_->CmdPushConstants(cmd, pSynth_.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);

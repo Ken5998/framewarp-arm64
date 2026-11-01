@@ -90,7 +90,17 @@ the flow in both directions and trusts it only where they agree (sharper on
 complex motion, about twice the work). Upstream win-fg bound its two flow
 images to the synthesis the wrong way round, so every warp sampled from the
 wrong side; framewarp binds them the right way, and `tests/flow_test.cpp`
-checks the result. Their cost on the Retroid Pocket 6 is not measured yet.
+checks the result. On the Retroid Pocket 6 with Azimuth at 1280x720 the
+flow costs about 1.5-5 ms and each generated frame 0.3-1.5 ms.
+
+`FRAMEWARP_MODE=flow-debug` shows what the flow found instead of using it:
+no generated frames, and each real frame in grey with the motion drawn in
+colour, the hue for the direction and the strength for the size (full at 48
+pixels per real frame), with a colour wheel at the top left as the key.
+White means the flow hit its limit of a tenth of the screen; plain grey means
+the pixel didn't change. If the colours follow the road and the cars, the
+flow is right and the fault is in the synthesis; if they are noise, the
+frames don't carry enough to solve it.
 
 ### Camera mode
 
@@ -156,7 +166,7 @@ now.
 | `FRAMEWARP_MAX_MULT` | `3` | with `auto`, the most frames shown per real frame |
 | `FRAMEWARP_REFRESH` | `60` | the panel's refresh rate, for `auto` |
 | `FRAMEWARP_FORCE_FIFO` | `1` | forces FIFO presents, so every frame gets its own refresh |
-| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `camera-debug` does the same and colours the generated frames: blue where it keeps the picture still, yellow where the camera moves it less than 2 pixels per real frame; `flow` pushes the frame along win-fg's optical flow; `interp` interpolates with it (one real frame of latency); `copy` repeats the last real frame; `debug` overlays the block motion; `off` shows only the real frames |
+| `FRAMEWARP_MODE` | `warp` | `warp`; `camera` moves the whole picture with one motion (see above); `camera-debug` does the same and colours the generated frames: blue where it keeps the picture still, yellow where the camera moves it less than 2 pixels per real frame; `flow` pushes the frame along win-fg's optical flow; `interp` interpolates with it (one real frame of latency); `flow-debug` draws that flow over the real frames (see above); `copy` repeats the last real frame; `debug` overlays the block motion; `off` shows only the real frames |
 | `FRAMEWARP_FLOW_PRESET` | `1` | `flow` and `interp`: flow solved at 1/2 (`0`), 1/4 (`1`) or 1/8 (`2`) size |
 | `FRAMEWARP_FLOW_MODEL` | `3` | `flow` and `interp`: `4` searches the flow both ways and trusts it where they agree |
 | `FRAMEWARP_CONTROL` | `~/.config/framewarp/mode` | the control file `framewarp-mode` writes |

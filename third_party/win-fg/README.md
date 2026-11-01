@@ -17,6 +17,8 @@ each marked `framewarp:` in the code:
   several generated frames can be in flight;
 - `wfg_synth.comp` extrapolates when asked (alpha above 1): it pushes the
   current frame along its flow and blends nothing from the previous one;
+- with the extrapolate value 2 it draws the flow over the current frame
+  instead (framewarp's `flow-debug`);
 - the real frames are sampled in `VK_IMAGE_LAYOUT_GENERAL`;
 - `FrameGen::resetScratch()` frees the per-size descriptors before a resize;
 - the SPIR-V is compiled at build time instead of a generated table, and

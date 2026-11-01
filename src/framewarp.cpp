@@ -66,9 +66,10 @@ enum Mode {
     kFlow = 5,        // win-fg optical flow, extrapolated
     kInterp = 6,      // win-fg optical flow, interpolated (one real frame of latency)
     kOff = 7,         // only the real frames
+    kFlowDebug = 8,   // the real frames with win-fg's flow drawn over them
 };
 
-const char *const kModeNames[] = {"copy", "warp", "debug", "camera", "camera-debug", "flow", "interp", "off"};
+const char *const kModeNames[] = {"copy", "warp", "debug", "camera", "camera-debug", "flow", "interp", "off", "flow-debug"};
 
 int parse_mode(const char *name)
 {
@@ -80,7 +81,7 @@ int parse_mode(const char *name)
     return -1;
 }
 
-bool uses_flow(int mode) { return mode == kFlow || mode == kInterp; }
+bool uses_flow(int mode) { return mode == kFlow || mode == kInterp || mode == kFlowDebug; }
 bool uses_motion(int mode) { return mode >= kWarp && mode <= kCameraDebug; }
 
 struct Config {
@@ -355,10 +356,14 @@ struct QueueData {
 // cmd[0] copies the real frame, cmd[1..] draw the generated frames and
 // cmd[kAnalysis] estimates the motion. Timestamp pair i belongs to cmd[i].
 constexpr int kAnalysis = kMaxMultiplier;
+// flow-debug draws the flow over the real frame with cmd[kOverlay].
+constexpr int kOverlay = kMaxMultiplier + 1;
+constexpr int kSlotCmds = kMaxMultiplier + 2;
 
 struct Slot {
-    VkCommandBuffer cmd[kMaxMultiplier + 1] = {};
+    VkCommandBuffer cmd[kSlotCmds] = {};
     VkSemaphore copy_done = VK_NULL_HANDLE;
+    VkSemaphore overlay_done = VK_NULL_HANDLE;
     VkSemaphore acquired[kMaxMultiplier] = {};
     VkSemaphore drawn[kMaxMultiplier] = {};
     VkFence fence = VK_NULL_HANDLE;
@@ -671,6 +676,7 @@ void destroy_resources(SwapchainData *sc)
         d->DeviceWaitIdle(dv);
     for (auto &s : sc->slots) {
         if (s.copy_done) d->DestroySemaphore(dv, s.copy_done, nullptr);
+        if (s.overlay_done) d->DestroySemaphore(dv, s.overlay_done, nullptr);
         for (int k = 0; k < kMaxMultiplier; k++) {
             if (s.acquired[k]) d->DestroySemaphore(dv, s.acquired[k], nullptr);
             if (s.drawn[k]) d->DestroySemaphore(dv, s.drawn[k], nullptr);
@@ -983,7 +989,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cbai.commandPool = sc->cmd_pool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = kMaxMultiplier + 1;
+        cbai.commandBufferCount = kSlotCmds;
         CHECK(d->AllocateCommandBuffers(dv, &cbai, s.cmd));
         for (auto c : s.cmd) {
             // Command buffers made by a layer need the loader's dispatch table.
@@ -994,6 +1000,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         }
         VkSemaphoreCreateInfo semci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         CHECK(d->CreateSemaphore(dv, &semci, nullptr, &s.copy_done));
+        CHECK(d->CreateSemaphore(dv, &semci, nullptr, &s.overlay_done));
         for (int k = 0; k < kMaxMultiplier; k++) {
             CHECK(d->CreateSemaphore(dv, &semci, nullptr, &s.acquired[k]));
             CHECK(d->CreateSemaphore(dv, &semci, nullptr, &s.drawn[k]));
@@ -1004,7 +1011,7 @@ bool create_resources(SwapchainData *sc, uint32_t family)
         if (sc->timestamps) {
             VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qci.queryCount = 2 * (kMaxMultiplier + 1);
+            qci.queryCount = 2 * kSlotCmds;
             CHECK(d->CreateQueryPool(dv, &qci, nullptr, &s.queries));
         }
         {
@@ -1117,8 +1124,8 @@ void collect_timestamps(SwapchainData *sc, Slot &s)
     if (!sc->timestamps || !s.used)
         return;
     DeviceData *d = sc->dev;
-    uint64_t v[2 * (kMaxMultiplier + 1)][2] = {};
-    VkResult r = d->GetQueryPoolResults(d->device, s.queries, 0, 2 * (kMaxMultiplier + 1), sizeof v, v, sizeof v[0],
+    uint64_t v[2 * kSlotCmds][2] = {};
+    VkResult r = d->GetQueryPoolResults(d->device, s.queries, 0, 2 * kSlotCmds, sizeof v, v, sizeof v[0],
                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
     if (r != VK_SUCCESS && r != VK_NOT_READY)
         return;
@@ -1381,7 +1388,7 @@ bool submit_flow(SwapchainData *sc, VkQueue queue, Slot &s, int slot_index)
 // win-fg engine first writes the frame at that time into sc->generated and
 // the draw shows it; otherwise the draw makes the frame itself (draw_mode).
 VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, float phase, int draw_mode, float alpha,
-                           bool extrapolate, uint32_t image, VkSemaphore wait, VkSemaphore signal)
+                           float variant, uint32_t image, VkSemaphore wait, VkSemaphore signal)
 {
     DeviceData *d = sc->dev;
     VkCommandBuffer cmd = s.cmd[k];
@@ -1397,7 +1404,7 @@ VkResult record_and_submit(SwapchainData *sc, VkQueue queue, Slot &s, int k, flo
         memory_barrier(d, cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        sc->dev->fg->recordSynth(cmd, alpha, extrapolate);
+        sc->dev->fg->recordSynth(cmd, alpha, variant);
         memory_barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
@@ -1480,7 +1487,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
             sc->auto_mult.update(t0, t0 - st.last_real, g_cfg.reserve - 1);
     }
     int shown_per_real = auto_mult ? std::min(sc->auto_mult.generated + 1, g_cfg.reserve) : g_cfg.multiplier;
-    if (mode == kOff)
+    if (mode == kOff || mode == kFlowDebug)
         shown_per_real = 1;
     st.last_real = t0;
     st.real++;
@@ -1504,7 +1511,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     d->BeginCommandBuffer(cmd, &bi);
     if (sc->timestamps) {
-        d->CmdResetQueryPool(cmd, s.queries, 0, 2 * (kMaxMultiplier + 1));
+        d->CmdResetQueryPool(cmd, s.queries, 0, 2 * kSlotCmds);
         d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.queries, 0);
     }
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -1560,7 +1567,8 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
     // 2. The optical flow modes solve the flow between the last two real
     //    frames first; interpolation needs it before the real frame shows.
     double t1 = now_s();
-    const bool flow = uses_flow(mode) && shown_per_real > 1 && submit_flow(sc, queue, s, slot_index);
+    const bool flow = uses_flow(mode) && (shown_per_real > 1 || mode == kFlowDebug) &&
+                      submit_flow(sc, queue, s, slot_index);
     const bool interp = flow && mode == kInterp;
     VkResult result = VK_SUCCESS;
 
@@ -1585,7 +1593,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
             } else if (uses_flow(mode) || mode == kOff || !sc->has_prev) {
                 draw_mode = kCopy; // no flow yet (first frame) or no engine
             }
-            if (record_and_submit(sc, queue, s, k, phase, draw_mode, alpha, !interp, idx, s.acquired[k],
+            if (record_and_submit(sc, queue, s, k, phase, draw_mode, alpha, interp ? 0.0f : 1.0f, idx, s.acquired[k],
                                   s.drawn[k]) != VK_SUCCESS) {
                 st.missed++;
                 break;
@@ -1613,9 +1621,18 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         present_generated();
 
     // 4. Present the real frame, keeping whatever the game chained to it.
+    //    flow-debug first draws the flow over it, in the game's own image.
+    VkSemaphore real_ready = s.copy_done;
+    if (flow && mode == kFlowDebug) {
+        if (record_and_submit(sc, queue, s, kOverlay, 0.0f, kFlowDebug, 1.0f, 2.0f, pi->pImageIndices[0],
+                              s.copy_done, s.overlay_done) == VK_SUCCESS)
+            real_ready = s.overlay_done;
+        else
+            st.missed++;
+    }
     VkPresentInfoKHR real = *pi;
     real.waitSemaphoreCount = 1;
-    real.pWaitSemaphores = &s.copy_done;
+    real.pWaitSemaphores = &real_ready;
     VkResult rr = d->QueuePresentKHR(queue, &real);
     st.shown += rr >= 0;
     if (rr < 0)

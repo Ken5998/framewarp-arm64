@@ -53,7 +53,8 @@ layout(binding = 0) uniform U {
 // framewarp: per generated frame, so several can be in flight at once.
 layout(push_constant) uniform PC {
     float alpha;       // temporal position of generated frame, 0=prev .. 1=curr, >1 past curr
-    float extrapolate; // >0.5: push curr forward along its motion, no blend with prev
+    float extrapolate; // >0.5: push curr forward along its motion, no blend with prev;
+                       // >1.5: draw the flow over curr (framewarp flow-debug)
 } pc;
 layout(binding = 32) uniform sampler2D uPrev;      // I0
 layout(binding = 33) uniform sampler2D uCurr;      // I1
@@ -64,6 +65,17 @@ layout(binding = 48, rgba8) uniform writeonly image2D uOut;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);    // Rec.709
 float luma(vec3 c) { return dot(c, LUMA); }
+
+// framewarp flow-debug: the colour of a motion of v px per real frame. Hue is
+// the direction (red right, yellow-green down, cyan left, violet up),
+// strength the size (square root, full at kViewFull px).
+const float kViewFull = 48.0;
+vec3 flowColor(vec2 v, float base) {
+    float n = sqrt(clamp(length(v) / kViewFull, 0.0, 1.0)); // small moves show too
+    float h = atan(v.y, v.x) / 6.2831853 + 1.0;
+    vec3 rgb = clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    return mix(vec3(base), rgb, n);
+}
 
 void main() {
     float alpha = pc.alpha;
@@ -99,6 +111,30 @@ void main() {
     vec4 sFwd = texture(uFlowFwd, uv);            // F10 curr->prev
     vec2 F01  = sBwd.xy * fs * invDim;
     vec2 F10  = sFwd.xy * fs * invDim;
+    // framewarp flow-debug: the real frame in grey with the motion it found
+    // in colour, white where it hit the 10% clamp, plain grey where nothing
+    // changed, and a colour wheel at the top left as the key.
+    if (pc.extrapolate > 1.5) {
+        vec3 c1 = texture(uCurr, uv).rgb;
+        float base = 0.25 + 0.5 * luma(c1);
+        vec2 key = vec2(gid) - vec2(64.0);
+        if (length(key) < 56.0) {
+            vec3 k = length(key) > 52.0 ? vec3(0.0) : flowColor(key * (kViewFull / 52.0), 0.5);
+            imageStore(uOut, gid, vec4(k, 1.0));
+            return;
+        }
+        vec2 v = -sFwd.xy; // content moves by F01 = -F10 per real frame
+        vec3 d = abs(c1 - texture(uPrev, uv).rgb);
+        vec3 o;
+        if (max(d.r, max(d.g, d.b)) < 3.0 / 255.0)
+            o = vec3(base);
+        else if (length(v * invDim) > 0.10)
+            o = vec3(1.0);
+        else
+            o = flowColor(v, base);
+        imageStore(uOut, gid, vec4(o, 1.0));
+        return;
+    }
     float cf01 = clamp(sBwd.w, 0.0, 1.0);         // front-end confidence
     float cf10 = clamp(sFwd.w, 0.0, 1.0);
 

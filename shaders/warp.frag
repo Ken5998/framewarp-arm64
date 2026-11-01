@@ -29,6 +29,10 @@ void main()
         color = vec4(mix(texture(generated, uv).rgb, pc.tint.rgb, pc.tint.a), 1.0);
         return;
     }
+    if (pc.mode == 8) { // flow-debug: win-fg drew the flow view
+        color = vec4(texture(generated, uv).rgb, 1.0);
+        return;
+    }
     vec2 px = 1.0 / vec2(textureSize(frame, 0));
     vec3 here = texture(frame, uv).rgb;
     vec2 m = vec2(0.0);
