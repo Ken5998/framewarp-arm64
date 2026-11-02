@@ -44,11 +44,13 @@ jobs:
           sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
           scripts/release-notes.sh "v$version" > notes.md
           cat >> notes.md <<NOTES
-          ## Install
+          ## Trying it
 
-          On ArmadaOS, in Desktop Mode, extract the package and run framewarp/install.sh. Then start the game from Steam with FRAMEWARP=1 FRAMEWARP_MULT=3 in front of its launch options; the measurements go to ~/framewarp.log. See the README for the settings.
+          framewarp is a Vulkan layer that generates extra frames for games on Turnip, written for the Retroid Pocket 6. It does nothing until a game asks for it.
 
-          SHA-256: \`$sha256\`
+          Extract framewarp-$version-aarch64.tar.gz and run framewarp/install.sh in Desktop Mode (it installs for your user; \`--uninstall\` removes it). Then put \`FRAMEWARP=1 FRAMEWARP_MULT=3\` in front of the game's Steam launch options, with LSFG-VK and the Quick Access frame limit off for that game. While playing, \`framewarp-mode interp|flow|camera|off\` switches mode; measurements go to ~/framewarp.log.
+
+          Still an experiment: the README explains what each mode does well and badly. SHA-256: \`$sha256\`
           NOTES
           if gh release view "v$version" > /dev/null 2>&1; then
             gh release upload "v$version" "$archive" --clobber
